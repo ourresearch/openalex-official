@@ -125,6 +125,35 @@ openalex-content download --api-key KEY --output ./pdfs --fresh
 
 All activity is logged to `openalex-download.log` in the output directory, regardless of terminal mode.
 
+## High-Throughput Deployment
+
+The download speed is typically limited by **network bandwidth**, not the tool or API. On a typical home connection (~400 Mbps), expect ~10-15 files/sec (~1M files/day). To achieve higher throughput (5M+ files/day), deploy from a cloud environment:
+
+**Performance scaling:**
+
+| Environment | Bandwidth | Workers | Expected Rate |
+|-------------|-----------|---------|---------------|
+| Home connection | 400 Mbps | 50 | ~10-15 files/sec |
+| Cloud VM (standard) | 1-5 Gbps | 100-150 | ~30-50 files/sec |
+| Cloud VM (high-perf) | 10+ Gbps | 200-300 | ~60+ files/sec |
+
+**Recommendations for large-scale downloads:**
+
+1. **Run from cloud** - Deploy on AWS EC2, GCP, or Azure VMs with high network bandwidth. Instances close to Cloudflare edge locations will have lower latency.
+
+2. **Increase workers** - Use `--workers 150` or higher to saturate available bandwidth. Monitor with verbose mode to find the optimal setting.
+
+3. **Use S3 storage** - For very large downloads, stream directly to S3 instead of local disk:
+   ```bash
+   openalex-content download \
+     --api-key KEY \
+     --storage s3 \
+     --s3-bucket my-corpus \
+     --workers 200
+   ```
+
+4. **Parallelize across machines** - For the full corpus, run multiple instances with different filters (e.g., by publication year) on separate machines.
+
 ## Requirements
 
 - Python 3.9+
