@@ -67,12 +67,17 @@ class DownloadOrchestrator:
 
         # Control flags
         self._shutdown_requested = False
-        self._work_queue: asyncio.Queue[WorkItem | None] = asyncio.Queue()
-        self._results_queue: asyncio.Queue[DownloadResult] = asyncio.Queue()
+        # Queues are created in run() to ensure they're in the correct event loop
+        self._work_queue: asyncio.Queue[WorkItem | None] | None = None
+        self._results_queue: asyncio.Queue[DownloadResult] | None = None
 
     async def run(self, progress_tracker: ProgressTracker | None = None) -> None:
         """Run the download job."""
         self.progress_tracker = progress_tracker
+
+        # Create queues in the running event loop (Python 3.9 compatibility)
+        self._work_queue = asyncio.Queue()
+        self._results_queue = asyncio.Queue()
 
         # Set up signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
