@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from openalex_content.checkpoint import Checkpoint, CheckpointManager, DownloadStats
+from openalex_cli.checkpoint import Checkpoint, CheckpointManager, DownloadStats
 
 
 class TestCheckpoint:

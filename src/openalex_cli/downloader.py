@@ -15,7 +15,7 @@ from .checkpoint import CheckpointManager
 from .progress import ProgressTracker
 from .rate_limiter import AdaptiveRateLimiter
 from .storage import LocalStorage, S3Storage, StorageBackend
-from .utils import ContentFormat, StorageType, work_id_to_path
+from .utils import ContentFormat, StorageType, doi_to_filename, work_id_to_path
 
 
 @dataclass
@@ -28,13 +28,15 @@ class DownloadConfig:
     s3_bucket: str | None = None
     s3_prefix: str = ""
     filter_str: str | None = None
-    content_format: ContentFormat = ContentFormat.PDF
-    with_metadata: bool = False
+    content_format: ContentFormat = ContentFormat.NONE  # Default: metadata only
     workers: int = 50
     resume: bool = True
     fresh: bool = False
     quiet: bool = False
     verbose: bool = False
+    nested: bool = False
+    work_ids: list[str] | None = None
+    original_identifiers: dict[str, str] | None = None  # Maps work_id -> original input (e.g., DOI)
 
 
 class DownloadOrchestrator:
@@ -93,10 +95,15 @@ class DownloadOrchestrator:
             # Log start
             if self.progress_tracker:
                 self.progress_tracker.log_info(
-                    f"Starting download with filter: {self.config.filter_str or '(all content)'}"
+                    f"Starting download with filter: {self.config.filter_str or '(all works)'}"
+                )
+                content_desc = (
+                    "metadata only"
+                    if self.config.content_format == ContentFormat.NONE
+                    else f"metadata + {self.config.content_format.value}"
                 )
                 self.progress_tracker.log_info(
-                    f"Format: {self.config.content_format.value}, Workers: {self.config.workers}"
+                    f"Content: {content_desc}, Workers: {self.config.workers}"
                 )
 
             # Start worker tasks
@@ -190,9 +197,17 @@ class DownloadOrchestrator:
         )
 
     async def _produce_work(self) -> None:
-        """Paginate through API and queue work items."""
+        """Paginate through API and queue work items, or yield provided IDs directly."""
+        # ID-list mode: yield provided work IDs directly without API pagination
+        if self.config.work_ids:
+            await self._produce_work_from_ids()
+            return
+
+        # Standard mode: paginate through API
         checkpoint = self.checkpoint_manager.get()
         cursor = checkpoint.current_cursor
+        warned_about_flat = False
+        total_count = 0
 
         try:
             async for works, next_cursor in self.api_client.list_works(
@@ -202,6 +217,20 @@ class DownloadOrchestrator:
             ):
                 if self._shutdown_requested:
                     break
+
+                # Track total and warn about flat directory for large downloads
+                total_count += len(works)
+                if (
+                    not warned_about_flat
+                    and total_count > 10000
+                    and not self.config.nested
+                    and self.progress_tracker
+                ):
+                    self.progress_tracker.log_warning(
+                        f"Downloading {total_count:,}+ files to flat directory. "
+                        "Consider using --nested for better filesystem performance."
+                    )
+                    warned_about_flat = True
 
                 for work in works:
                     if self._shutdown_requested:
@@ -226,8 +255,32 @@ class DownloadOrchestrator:
             if self.progress_tracker:
                 self.progress_tracker.log_error(f"Error listing works: {e}")
 
+    async def _produce_work_from_ids(self) -> None:
+        """Queue work items from provided ID list (no API pagination)."""
+        if not self.config.work_ids:
+            return
+
+        # Fetch metadata for each work ID from the list API
+        # We need basic info like has_pdf/has_xml
+        for work_id in self.config.work_ids:
+            if self._shutdown_requested:
+                break
+
+            # Skip already completed
+            if self.checkpoint_manager.is_completed(work_id):
+                continue
+
+            try:
+                # Fetch work metadata from singleton API
+                metadata = await self.api_client.get_work_metadata(work_id)
+                work = WorkItem.from_api_response(metadata)
+                await self._work_queue.put(work)
+            except Exception as e:
+                if self.progress_tracker:
+                    self.progress_tracker.log_error(f"Error fetching metadata for {work_id}: {e}")
+
     async def _download_worker(self, worker_id: int) -> None:
-        """Worker that downloads content."""
+        """Worker that downloads metadata and optionally content."""
         while not self._shutdown_requested:
             try:
                 work = await asyncio.wait_for(self._work_queue.get(), timeout=1.0)
@@ -237,7 +290,45 @@ class DownloadOrchestrator:
             if work is None:
                 break
 
-            # Determine formats to download
+            # Determine filename base: use original DOI if provided, else work_id
+            filename_base = work.work_id
+            if (
+                self.config.original_identifiers
+                and work.work_id in self.config.original_identifiers
+            ):
+                orig = self.config.original_identifiers[work.work_id]
+                # If original was a DOI, use DOI-based filename
+                if orig.startswith("10."):
+                    filename_base = doi_to_filename(orig)
+
+            # Always save full metadata (fetch from singleton API)
+            try:
+                full_metadata = await self.api_client.get_work_metadata(work.work_id)
+                meta_path = str(
+                    work_id_to_path(filename_base, "json", nested=self.config.nested)
+                )
+                meta_content = json.dumps(full_metadata, indent=2).encode()
+                await self.storage.save(meta_path, meta_content, "application/json")
+            except Exception as e:
+                if self.progress_tracker:
+                    self.progress_tracker.log_warning(
+                        f"Failed to fetch metadata for {work.work_id}: {e}"
+                    )
+
+            # If no content requested, we're done with this work
+            if self.config.content_format == ContentFormat.NONE:
+                # Report success for metadata-only download
+                result = DownloadResult(
+                    work_id=work.work_id,
+                    format=ContentFormat.NONE,
+                    success=True,
+                    file_size=len(meta_content) if meta_content else 0,
+                    credits_cost=0,  # Singleton API is free
+                )
+                await self._results_queue.put(result)
+                continue
+
+            # Determine content formats to download
             formats = []
             if self.config.content_format in (ContentFormat.PDF, ContentFormat.BOTH):
                 if work.has_pdf:
@@ -245,6 +336,18 @@ class DownloadOrchestrator:
             if self.config.content_format in (ContentFormat.XML, ContentFormat.BOTH):
                 if work.has_xml:
                     formats.append(ContentFormat.XML)
+
+            # If no content available for requested formats, report success (metadata was saved)
+            if not formats:
+                result = DownloadResult(
+                    work_id=work.work_id,
+                    format=self.config.content_format,
+                    success=True,
+                    file_size=len(meta_content) if meta_content else 0,
+                    credits_cost=0,
+                )
+                await self._results_queue.put(result)
+                continue
 
             for fmt in formats:
                 await self.rate_limiter.acquire()
@@ -263,17 +366,11 @@ class DownloadOrchestrator:
                     if result.success and result.content:
                         # Save content
                         ext = "pdf" if fmt == ContentFormat.PDF else "tei.xml"
-                        path = str(work_id_to_path(work.work_id, ext))
+                        path = str(work_id_to_path(filename_base, ext, nested=self.config.nested))
                         content_type = (
                             "application/pdf" if fmt == ContentFormat.PDF else "application/xml"
                         )
                         await self.storage.save(path, result.content, content_type)
-
-                        # Save metadata if requested
-                        if self.config.with_metadata:
-                            meta_path = str(work_id_to_path(work.work_id, "json"))
-                            meta_content = json.dumps(work.raw_data, indent=2).encode()
-                            await self.storage.save(meta_path, meta_content, "application/json")
 
                     await self._results_queue.put(result)
 

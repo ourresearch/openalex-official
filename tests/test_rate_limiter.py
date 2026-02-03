@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from openalex_content.rate_limiter import AdaptiveRateLimiter, APIHealth
+from openalex_cli.rate_limiter import AdaptiveRateLimiter, APIHealth
 
 
 class TestAdaptiveRateLimiter:

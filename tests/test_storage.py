@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from openalex_content.storage.local import LocalStorage
+from openalex_cli.storage.local import LocalStorage
 
 
 class TestLocalStorage:

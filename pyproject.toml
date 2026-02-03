@@ -3,16 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "openalex-content-downloader"
-version = "0.1.1"
-description = "Bulk download PDFs and TEI XML files from OpenAlex"
+name = "openalex-official"
+version = "0.3.0"
+description = "Official command-line interface for OpenAlex"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
     { name = "OpenAlex Team", email = "team@openalex.org" }
 ]
-keywords = ["openalex", "pdf", "download", "scholarly", "research"]
+keywords = ["openalex", "cli", "pdf", "download", "scholarly", "research", "academic"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -46,16 +46,16 @@ dev = [
 ]
 
 [project.scripts]
-openalex-content = "openalex_content.cli:main"
+openalex = "openalex_cli.cli:main"
 
 [project.urls]
 Homepage = "https://openalex.org"
-Documentation = "https://docs.openalex.org/download/bulk-content-tool"
-Repository = "https://github.com/ourresearch/openalex-content-downloader"
-Issues = "https://github.com/ourresearch/openalex-content-downloader/issues"
+Documentation = "https://docs.openalex.org/download/openalex-official"
+Repository = "https://github.com/ourresearch/openalex-official"
+Issues = "https://github.com/ourresearch/openalex-official/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openalex_content"]
+packages = ["src/openalex_cli"]
 
 [tool.hatch.build.targets.sdist]
 include = [

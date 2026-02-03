@@ -128,35 +128,41 @@ class OpenAlexAPIClient:
     async def list_works(
         self,
         filter_str: str | None = None,
-        content_format: ContentFormat = ContentFormat.PDF,
+        content_format: ContentFormat = ContentFormat.NONE,
         cursor: str = "*",
     ) -> AsyncIterator[tuple[list[WorkItem], str | None]]:
         """
-        List works with content, using cursor pagination.
+        List works using cursor pagination.
+
+        When content_format is NONE (metadata only), no has_content filter is added.
+        When content_format specifies content types, filters for available content.
 
         Yields tuples of (works_list, next_cursor).
         When next_cursor is None, pagination is complete.
         """
         session = await self._get_session()
 
-        # Build filter with has_content requirement
-        content_filter = (
-            "has_content.pdf:true"
-            if content_format in (ContentFormat.PDF, ContentFormat.BOTH)
-            else "has_content.tei_xml:true"
-        )
-        if filter_str:
-            full_filter = f"{content_filter},{filter_str}"
-        else:
-            full_filter = content_filter
+        # Build filter - only add has_content requirement when downloading content
+        full_filter = filter_str
+        if content_format != ContentFormat.NONE:
+            content_filter = (
+                "has_content.pdf:true"
+                if content_format in (ContentFormat.PDF, ContentFormat.BOTH)
+                else "has_content.tei_xml:true"
+            )
+            if filter_str:
+                full_filter = f"{content_filter},{filter_str}"
+            else:
+                full_filter = content_filter
 
         while cursor:
             params = {
-                "filter": full_filter,
                 "cursor": cursor,
                 "per-page": self.per_page,
                 "api_key": self.api_key,
             }
+            if full_filter:
+                params["filter"] = full_filter
             url = f"{self.WORKS_API_BASE}/works"
 
             async with session.get(url, params=params) as response:
@@ -265,3 +271,80 @@ class OpenAlexAPIClient:
                 success=False,
                 error="Request timed out",
             )
+
+    async def get_work_metadata(self, work_id: str) -> dict:
+        """
+        Fetch full work metadata from singleton API.
+
+        This provides the complete Work object, unlike the abbreviated
+        data returned by the list API.
+
+        Args:
+            work_id: OpenAlex work ID (e.g., W2741809807)
+
+        Returns:
+            Full work metadata as dict
+
+        Raises:
+            Exception if request fails
+        """
+        session = await self._get_session()
+        url = f"{self.WORKS_API_BASE}/works/{work_id}"
+        params = {"api_key": self.api_key}
+
+        async with session.get(url, params=params) as response:
+            if response.status == 404:
+                raise Exception(f"Work not found: {work_id}")
+            response.raise_for_status()
+            return await response.json()
+
+    async def resolve_dois(self, dois: list[str]) -> dict[str, str]:
+        """
+        Resolve DOIs to OpenAlex work IDs.
+
+        Uses the OpenAlex filter API with OR filters to batch resolve
+        multiple DOIs efficiently.
+
+        Args:
+            dois: List of DOIs (e.g., ['10.1038/nature12373', '10.1126/science.1234'])
+
+        Returns:
+            Dict mapping DOI -> OpenAlex work ID
+            DOIs not found in OpenAlex are omitted from the result.
+        """
+        session = await self._get_session()
+        results: dict[str, str] = {}
+
+        # Batch DOIs in groups of 50 for efficient lookup
+        batch_size = 50
+        for i in range(0, len(dois), batch_size):
+            batch = dois[i : i + batch_size]
+
+            # Build OR filter: doi:10.xxx|doi:10.yyy
+            filter_parts = [f"doi:{doi}" for doi in batch]
+            filter_str = "|".join(filter_parts)
+
+            params = {
+                "filter": filter_str,
+                "per-page": batch_size,
+                "api_key": self.api_key,
+            }
+            url = f"{self.WORKS_API_BASE}/works"
+
+            try:
+                async with session.get(url, params=params) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+
+                for work in data.get("results", []):
+                    doi = work.get("doi")
+                    work_id = work.get("id", "").replace("https://openalex.org/", "")
+                    if doi and work_id:
+                        # Normalize DOI (remove https://doi.org/ prefix if present)
+                        clean_doi = doi.replace("https://doi.org/", "")
+                        results[clean_doi] = work_id
+            except Exception:
+                # Continue with next batch on error
+                continue
+
+        return results
