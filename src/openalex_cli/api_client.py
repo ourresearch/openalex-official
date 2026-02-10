@@ -194,7 +194,8 @@ class OpenAlexAPIClient:
         session = await self._get_session()
 
         # Determine file extension
-        ext = "pdf" if content_format == ContentFormat.PDF else "tei.xml"
+        # OpenAlex Content API uses .grobid-xml for TEI XML content
+        ext = "pdf" if content_format == ContentFormat.PDF else "grobid-xml"
         url = f"{self.CONTENT_API_BASE}/works/{work_id}.{ext}"
 
         try:

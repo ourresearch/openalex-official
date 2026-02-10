@@ -365,10 +365,10 @@ class DownloadOrchestrator:
 
                     if result.success and result.content:
                         # Save content
-                        ext = "pdf" if fmt == ContentFormat.PDF else "tei.xml"
+                        ext = "pdf" if fmt == ContentFormat.PDF else "xml.gz"
                         path = str(work_id_to_path(filename_base, ext, nested=self.config.nested))
                         content_type = (
-                            "application/pdf" if fmt == ContentFormat.PDF else "application/xml"
+                            "application/pdf" if fmt == ContentFormat.PDF else "application/gzip"
                         )
                         await self.storage.save(path, result.content, content_type)
 
