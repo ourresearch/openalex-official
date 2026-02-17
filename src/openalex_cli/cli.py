@@ -313,6 +313,9 @@ def download(
     finally:
         progress.stop()
 
+    if orchestrator._credits_exhausted:
+        sys.exit(1)
+
 
 @main.command()
 @click.option(

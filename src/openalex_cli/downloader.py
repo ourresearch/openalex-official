@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .api_client import DownloadResult, OpenAlexAPIClient, WorkItem
+from .api_client import CreditsExhaustedError, DownloadResult, OpenAlexAPIClient, WorkItem
 from .checkpoint import CheckpointManager
 from .progress import ProgressTracker
 from .rate_limiter import AdaptiveRateLimiter
@@ -69,6 +69,7 @@ class DownloadOrchestrator:
 
         # Control flags
         self._shutdown_requested = False
+        self._credits_exhausted = False
         # Queues are created in run() to ensure they're in the correct event loop
         self._work_queue: asyncio.Queue[WorkItem | None] | None = None
         self._results_queue: asyncio.Queue[DownloadResult] | None = None
@@ -153,6 +154,19 @@ class DownloadOrchestrator:
         if self.progress_tracker:
             self.progress_tracker.log_warning(
                 "Shutdown requested. Finishing current downloads..."
+            )
+
+    def _handle_credits_exhausted(self) -> None:
+        """Stop all work when credits are exhausted."""
+        if self._credits_exhausted:
+            return  # Already handled
+        self._credits_exhausted = True
+        self._shutdown_requested = True
+        if self.progress_tracker:
+            self.progress_tracker.log_error(
+                "Credits exhausted! Credits reset daily at midnight UTC. "
+                "Purchase more at https://openalex.org/pricing. "
+                "Progress has been saved — use --resume to continue later."
             )
 
     def _setup_checkpoint(self):
@@ -251,6 +265,8 @@ class DownloadOrchestrator:
                         cursor=next_cursor,
                     )
 
+        except CreditsExhaustedError:
+            self._handle_credits_exhausted()
         except Exception as e:
             if self.progress_tracker:
                 self.progress_tracker.log_error(f"Error listing works: {e}")
@@ -309,6 +325,9 @@ class DownloadOrchestrator:
                 )
                 meta_content = json.dumps(full_metadata, indent=2).encode()
                 await self.storage.save(meta_path, meta_content, "application/json")
+            except CreditsExhaustedError:
+                self._handle_credits_exhausted()
+                break
             except Exception as e:
                 if self.progress_tracker:
                     self.progress_tracker.log_warning(
@@ -350,6 +369,9 @@ class DownloadOrchestrator:
                 continue
 
             for fmt in formats:
+                if self._credits_exhausted:
+                    break
+
                 await self.rate_limiter.acquire()
                 start_time = time.time()
 
@@ -362,6 +384,10 @@ class DownloadOrchestrator:
                         success=result.success,
                         rate_limit_remaining=result.rate_limit_remaining,
                     )
+
+                    if result.error == "Credits exhausted":
+                        self._handle_credits_exhausted()
+                        break
 
                     if result.success and result.content:
                         # Save content

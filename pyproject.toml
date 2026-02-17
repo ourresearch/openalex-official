@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openalex-official"
-version = "0.3.0"
+version = "0.3.1"
 description = "Official command-line interface for OpenAlex"
 readme = "README.md"
 license = "MIT"

@@ -11,6 +11,12 @@ import aiohttp
 from .utils import ContentFormat
 
 
+class CreditsExhaustedError(Exception):
+    """Raised when the API key has no credits remaining."""
+
+    pass
+
+
 @dataclass
 class WorkItem:
     """A work item with its metadata."""
@@ -166,6 +172,23 @@ class OpenAlexAPIClient:
             url = f"{self.WORKS_API_BASE}/works"
 
             async with session.get(url, params=params) as response:
+                if response.status == 429:
+                    remaining = int(
+                        response.headers.get("X-RateLimit-Remaining", 0)
+                    )
+                    credits_required = int(
+                        response.headers.get("X-RateLimit-Credits-Required", 1)
+                    )
+                    if remaining < credits_required:
+                        raise CreditsExhaustedError(
+                            "Insufficient credits. Credits reset daily at midnight UTC."
+                        )
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=429,
+                        message="Rate limited",
+                    )
                 response.raise_for_status()
                 data = await response.json()
 
@@ -213,12 +236,19 @@ class OpenAlexAPIClient:
                     )
 
                 if response.status == 429:
+                    remaining = int(
+                        response.headers.get("X-RateLimit-Remaining", 0)
+                    )
+                    credits_required = int(
+                        response.headers.get("X-RateLimit-Credits-Required", 0)
+                    )
+                    is_exhausted = remaining < credits_required
                     return DownloadResult(
                         work_id=work_id,
                         format=content_format,
                         success=False,
-                        error="Rate limited",
-                        rate_limit_remaining=0,
+                        error="Credits exhausted" if is_exhausted else "Rate limited",
+                        rate_limit_remaining=remaining,
                     )
 
                 if response.status not in (301, 302, 307, 308):
@@ -295,6 +325,23 @@ class OpenAlexAPIClient:
         async with session.get(url, params=params) as response:
             if response.status == 404:
                 raise Exception(f"Work not found: {work_id}")
+            if response.status == 429:
+                remaining = int(
+                    response.headers.get("X-RateLimit-Remaining", 0)
+                )
+                credits_required = int(
+                    response.headers.get("X-RateLimit-Credits-Required", 1)
+                )
+                if remaining < credits_required:
+                    raise CreditsExhaustedError(
+                        "Insufficient credits. Credits reset daily at midnight UTC."
+                    )
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=429,
+                    message="Rate limited",
+                )
             response.raise_for_status()
             return await response.json()
 
