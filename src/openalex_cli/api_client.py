@@ -44,7 +44,7 @@ class WorkItem:
             authors=data.get("authorships"),
             type=data.get("type"),
             has_pdf=has_content.get("pdf", False),
-            has_xml=has_content.get("tei_xml", False),
+            has_xml=has_content.get("grobid_xml", False),
             raw_data=data,
         )
 
@@ -154,7 +154,7 @@ class OpenAlexAPIClient:
             content_filter = (
                 "has_content.pdf:true"
                 if content_format in (ContentFormat.PDF, ContentFormat.BOTH)
-                else "has_content.tei_xml:true"
+                else "has_content.grobid_xml:true"
             )
             if filter_str:
                 full_filter = f"{content_filter},{filter_str}"
@@ -217,7 +217,8 @@ class OpenAlexAPIClient:
         session = await self._get_session()
 
         # Determine file extension
-        ext = "pdf" if content_format == ContentFormat.PDF else "tei.xml"
+        # OpenAlex Content API uses .grobid-xml for TEI XML content
+        ext = "pdf" if content_format == ContentFormat.PDF else "grobid-xml"
         url = f"{self.CONTENT_API_BASE}/works/{work_id}.{ext}"
 
         try:
