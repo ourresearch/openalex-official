@@ -239,17 +239,25 @@ def download(
 
     if use_stdin or ids_str:
         raw_ids = _parse_input_ids(ids_str, use_stdin)
-        if raw_ids:
-            work_ids, original_identifiers = asyncio.run(
-                _resolve_identifiers(raw_ids, api_key, quiet)
+        if not raw_ids:
+            click.echo(
+                click.style("Error: ", fg="red")
+                + "No work IDs provided. Check your input.",
+                err=True,
             )
-            if not work_ids:
-                click.echo(
-                    click.style("Error: ", fg="red") + "No valid work IDs found.", err=True
-                )
-                sys.exit(1)
-            if not quiet:
-                click.echo(f"Found {len(work_ids)} work(s) to download.")
+            if use_stdin:
+                click.echo("  stdin was empty — verify your pipe or input file.", err=True)
+            sys.exit(1)
+        work_ids, original_identifiers = asyncio.run(
+            _resolve_identifiers(raw_ids, api_key, quiet)
+        )
+        if not work_ids:
+            click.echo(
+                click.style("Error: ", fg="red") + "No valid work IDs found.", err=True
+            )
+            sys.exit(1)
+        if not quiet:
+            click.echo(f"Found {len(work_ids)} work(s) to download.")
 
     # Parse content types
     content_format = ContentFormat.NONE
@@ -265,16 +273,27 @@ def download(
             content_format = ContentFormat.XML
 
     # Warn if no filter and no IDs provided
-    if not filter_str and not work_ids and not quiet:
-        click.echo(
-            click.style("Warning: ", fg="yellow")
-            + "No filter specified. This will download ALL works."
-        )
-        click.echo("Use --filter to narrow down the download. Example:")
-        click.echo('  --filter "publication_year:>2020,type:article"')
-        click.echo()
-        if not click.confirm("Continue with full download?"):
-            raise click.Abort()
+    if not filter_str and not work_ids:
+        # Detect piped stdin without --stdin flag
+        if not sys.stdin.isatty() and not use_stdin:
+            click.echo(
+                click.style("Error: ", fg="red")
+                + "It looks like you're piping input but didn't use --stdin.",
+                err=True,
+            )
+            click.echo("  Usage: cat ids.txt | openalex download --stdin --api-key KEY", err=True)
+            sys.exit(1)
+
+        if not quiet:
+            click.echo(
+                click.style("Warning: ", fg="yellow")
+                + "No filter specified. This will download ALL works."
+            )
+            click.echo("Use --filter to narrow down the download. Example:")
+            click.echo('  --filter "publication_year:>2020,type:article"')
+            click.echo()
+            if not click.confirm("Continue with full download?"):
+                raise click.Abort()
 
     # Build config
     config = DownloadConfig(

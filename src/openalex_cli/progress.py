@@ -226,10 +226,16 @@ class ProgressTracker:
                 APIHealth.RED: "red",
             }[self._rate_state.health]
 
+            health_label = {
+                APIHealth.GREEN: "healthy",
+                APIHealth.YELLOW: "slowing",
+                APIHealth.RED: "degraded",
+            }[self._rate_state.health]
+
             health_text = Text()
             health_text.append("●", style=health_color)
             health_text.append(
-                f" {self._rate_state.health.value} "
+                f" {health_label} "
                 f"(p95: {self._rate_state.p95_latency_ms:.0f}ms, "
                 f"workers: {self._rate_state.current_workers})"
             )

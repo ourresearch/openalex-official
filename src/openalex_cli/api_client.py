@@ -44,7 +44,7 @@ class WorkItem:
             authors=data.get("authorships"),
             type=data.get("type"),
             has_pdf=has_content.get("pdf", False),
-            has_xml=has_content.get("tei_xml", False),
+            has_xml=has_content.get("grobid_xml", False),
             raw_data=data,
         )
 
@@ -151,11 +151,12 @@ class OpenAlexAPIClient:
         # Build filter - only add has_content requirement when downloading content
         full_filter = filter_str
         if content_format != ContentFormat.NONE:
-            content_filter = (
-                "has_content.pdf:true"
-                if content_format in (ContentFormat.PDF, ContentFormat.BOTH)
-                else "has_content.tei_xml:true"
-            )
+            if content_format in (ContentFormat.PDF, ContentFormat.BOTH):
+                # For BOTH: cross-field OR isn't supported by the API, so we
+                # filter on PDF (which covers 99.8% of content-bearing works).
+                content_filter = "has_content.pdf:true"
+            else:
+                content_filter = "has_content.grobid_xml:true"
             if filter_str:
                 full_filter = f"{content_filter},{filter_str}"
             else:
