@@ -16,33 +16,33 @@ pip install openalex-official
 # Download metadata for works matching a filter
 openalex download \
   --api-key YOUR_API_KEY \
-  --output ./frogs \
+  --output ./results \
   --filter "topics.id:T10325"
 
 # Download metadata + PDFs
 openalex download \
   --api-key YOUR_API_KEY \
-  --output ./frogs \
+  --output ./results \
   --filter "topics.id:T10325" \
   --content pdf
 
 # Download metadata + PDFs + TEI XML
 openalex download \
   --api-key YOUR_API_KEY \
-  --output ./frogs \
+  --output ./results \
   --filter "topics.id:T10325" \
   --content pdf,xml
 
 # Download specific works by ID or DOI
 openalex download \
   --api-key YOUR_API_KEY \
-  --output ./papers \
+  --output ./results \
   --ids "W2741809807,10.1038/nature12373"
 
 # Download from a list of IDs via stdin
 cat work_ids.txt | openalex download \
   --api-key YOUR_API_KEY \
-  --output ./papers \
+  --output ./results \
   --stdin
 
 # Download to S3
