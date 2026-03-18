@@ -37,6 +37,8 @@ class DownloadConfig:
     nested: bool = False
     work_ids: list[str] | None = None
     original_identifiers: dict[str, str] | None = None  # Maps work_id -> original input (e.g., DOI)
+    sample: int | None = None  # Random sample size (max 10,000)
+    seed: int | None = None  # Seed for reproducible random samples
 
 
 class DownloadOrchestrator:
@@ -217,6 +219,11 @@ class DownloadOrchestrator:
             await self._produce_work_from_ids()
             return
 
+        # Sample mode: use page-based pagination with ?sample=N
+        if self.config.sample:
+            await self._produce_work_from_sample()
+            return
+
         # Standard mode: paginate through API
         checkpoint = self.checkpoint_manager.get()
         cursor = checkpoint.current_cursor
@@ -270,6 +277,55 @@ class DownloadOrchestrator:
         except Exception as e:
             if self.progress_tracker:
                 self.progress_tracker.log_error(f"Error listing works: {e}")
+
+    async def _produce_work_from_sample(self) -> None:
+        """Queue work items from a random sample (page-based pagination)."""
+        total_count = 0
+        warned_about_flat = False
+
+        try:
+            async for works in self.api_client.list_works_sample(
+                sample_size=self.config.sample,
+                seed=self.config.seed,
+                filter_str=self.config.filter_str,
+                content_format=self.config.content_format,
+            ):
+                if self._shutdown_requested:
+                    break
+
+                total_count += len(works)
+                if (
+                    not warned_about_flat
+                    and total_count > 10000
+                    and not self.config.nested
+                    and self.progress_tracker
+                ):
+                    self.progress_tracker.log_warning(
+                        f"Downloading {total_count:,}+ files to flat directory. "
+                        "Consider using --nested for better filesystem performance."
+                    )
+                    warned_about_flat = True
+
+                for work in works:
+                    if self._shutdown_requested:
+                        break
+
+                    # Skip already completed
+                    if self.checkpoint_manager.is_completed(work.work_id):
+                        continue
+
+                    await self._work_queue.put(work)
+
+                if self.progress_tracker:
+                    self.progress_tracker.log_info(
+                        f"Queued {total_count} works from sample..."
+                    )
+
+        except CreditsExhaustedError:
+            self._handle_credits_exhausted()
+        except Exception as e:
+            if self.progress_tracker:
+                self.progress_tracker.log_error(f"Error listing sample works: {e}")
 
     async def _produce_work_from_ids(self) -> None:
         """Queue work items from provided ID list (no API pagination)."""

@@ -205,6 +205,88 @@ class OpenAlexAPIClient:
             if not next_cursor:
                 break
 
+    async def list_works_sample(
+        self,
+        sample_size: int,
+        seed: int | None = None,
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+    ) -> AsyncIterator[list[WorkItem]]:
+        """
+        List a random sample of works using page-based pagination.
+
+        The OpenAlex API's ?sample=N parameter returns N random works.
+        Unlike cursor pagination, this uses page-based pagination.
+
+        Args:
+            sample_size: Number of random works to return (max 10,000)
+            seed: Optional seed for reproducible random samples
+            filter_str: Optional filter string
+            content_format: Content format filter (adds has_content filter if not NONE)
+
+        Yields lists of WorkItems, one per page.
+        """
+        session = await self._get_session()
+
+        # Build filter - same logic as list_works
+        full_filter = filter_str
+        if content_format != ContentFormat.NONE:
+            if content_format in (ContentFormat.PDF, ContentFormat.BOTH):
+                content_filter = "has_content.pdf:true"
+            else:
+                content_filter = "has_content.grobid_xml:true"
+            if filter_str:
+                full_filter = f"{content_filter},{filter_str}"
+            else:
+                full_filter = content_filter
+
+        import math
+        total_pages = math.ceil(sample_size / self.per_page)
+
+        for page in range(1, total_pages + 1):
+            params = {
+                "sample": sample_size,
+                "page": page,
+                "per-page": self.per_page,
+                "api_key": self.api_key,
+            }
+            if seed is not None:
+                params["seed"] = seed
+            if full_filter:
+                params["filter"] = full_filter
+
+            url = f"{self.WORKS_API_BASE}/works"
+
+            async with session.get(url, params=params) as response:
+                if response.status == 429:
+                    remaining = int(
+                        response.headers.get("X-RateLimit-Remaining", 0)
+                    )
+                    credits_required = int(
+                        response.headers.get("X-RateLimit-Credits-Required", 1)
+                    )
+                    if remaining < credits_required:
+                        raise CreditsExhaustedError(
+                            "Insufficient credits. Credits reset daily at midnight UTC."
+                        )
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=429,
+                        message="Rate limited",
+                    )
+                response.raise_for_status()
+                data = await response.json()
+
+            results = data.get("results", [])
+            works = [WorkItem.from_api_response(r) for r in results]
+
+            yield works
+
+            # Stop if we got fewer results than per_page (last page)
+            if len(results) < self.per_page:
+                break
+
     async def download_content(
         self,
         work_id: str,

@@ -177,6 +177,17 @@ def main() -> None:
     help="Ignore existing checkpoint and start fresh",
 )
 @click.option(
+    "--sample",
+    "sample_size",
+    type=click.IntRange(1, 10000),
+    help="Download a random sample of N works (max 10,000). Uses the API's sample parameter.",
+)
+@click.option(
+    "--seed",
+    type=int,
+    help="Seed for reproducible random samples (use with --sample).",
+)
+@click.option(
     "--quiet",
     "-q",
     is_flag=True,
@@ -202,6 +213,8 @@ def download(
     workers: int,
     resume: bool,
     fresh: bool,
+    sample_size: int | None,
+    seed: int | None,
     quiet: bool,
     verbose: bool,
 ) -> None:
@@ -232,6 +245,12 @@ def download(
     # Validate S3 options
     if storage == "s3" and not s3_bucket:
         raise click.UsageError("--s3-bucket is required when using S3 storage")
+
+    # Validate --sample options
+    if sample_size and (ids_str or use_stdin):
+        raise click.UsageError("--sample cannot be used with --ids or --stdin")
+    if seed is not None and not sample_size:
+        raise click.UsageError("--seed requires --sample")
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
@@ -312,6 +331,8 @@ def download(
         nested=nested,
         work_ids=work_ids,
         original_identifiers=original_identifiers,
+        sample=sample_size,
+        seed=seed,
     )
 
     # Create progress tracker
