@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,7 +88,10 @@ class DownloadOrchestrator:
         # Set up signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._request_shutdown)
+            if sys.platform == "win32":
+                signal.signal(sig, self._handle_windows_request_shutdown)
+            else:
+                loop.add_signal_handler(sig, self._request_shutdown)
 
         try:
             # Initialize or resume checkpoint
@@ -145,7 +149,10 @@ class DownloadOrchestrator:
 
             # Remove signal handlers
             for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.remove_signal_handler(sig)
+                if sys.platform == "win32":
+                    signal.signal(sig, signal.SIG_DFL)
+                else:
+                    loop.remove_signal_handler(sig)
 
     def _request_shutdown(self) -> None:
         """Handle shutdown signal."""
@@ -157,6 +164,10 @@ class DownloadOrchestrator:
             self.progress_tracker.log_warning(
                 "Shutdown requested. Finishing current downloads..."
             )
+
+    def _handle_windows_request_shutdown(self, *args, **kwargs) -> None:
+        """Handle shutdown signal on Windows."""
+        self._request_shutdown()
 
     def _handle_credits_exhausted(self) -> None:
         """Stop all work when credits are exhausted."""
