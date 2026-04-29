@@ -136,6 +136,8 @@ class OpenAlexAPIClient:
         filter_str: str | None = None,
         content_format: ContentFormat = ContentFormat.NONE,
         cursor: str = "*",
+        max_attempts: int = 3,
+        base_delay_seconds: float = 1.0,
     ) -> AsyncIterator[tuple[list[WorkItem], str | None]]:
         """
         List works using cursor pagination.
@@ -172,26 +174,31 @@ class OpenAlexAPIClient:
                 params["filter"] = full_filter
             url = f"{self.WORKS_API_BASE}/works"
 
-            async with session.get(url, params=params) as response:
-                if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 1)
-                    )
-                    if remaining < credits_required:
-                        raise CreditsExhaustedError(
-                            "Insufficient credits. Credits reset daily at midnight UTC."
+            attempt = 0
+            while True:
+                attempt += 1
+                async with session.get(url, params=params) as response:
+                    if response.status == 429:
+                        remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                        credits_required = int(
+                            response.headers.get("X-RateLimit-Credits-Required", 1)
                         )
-                    raise aiohttp.ClientResponseError(
-                        response.request_info,
-                        response.history,
-                        status=429,
-                        message="Rate limited",
-                    )
-                response.raise_for_status()
-                data = await response.json()
+                        if remaining < credits_required:
+                            raise CreditsExhaustedError(
+                                "Insufficient credits. Credits reset daily at midnight UTC."
+                            )
+                        if attempt >= max_attempts:
+                            raise aiohttp.ClientResponseError(
+                                response.request_info,
+                                response.history,
+                                status=429,
+                                message="Rate limited",
+                            )
+                        await asyncio.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+                        continue
+                    response.raise_for_status()
+                    data = await response.json()
+                    break
 
             results = data.get("results", [])
             works = [WorkItem.from_api_response(r) for r in results]
@@ -211,6 +218,8 @@ class OpenAlexAPIClient:
         seed: int | None = None,
         filter_str: str | None = None,
         content_format: ContentFormat = ContentFormat.NONE,
+        max_attempts: int = 3,
+        base_delay_seconds: float = 1.0,
     ) -> AsyncIterator[list[WorkItem]]:
         """
         List a random sample of works using page-based pagination.
@@ -241,6 +250,7 @@ class OpenAlexAPIClient:
                 full_filter = content_filter
 
         import math
+
         total_pages = math.ceil(sample_size / self.per_page)
 
         for page in range(1, total_pages + 1):
@@ -257,26 +267,31 @@ class OpenAlexAPIClient:
 
             url = f"{self.WORKS_API_BASE}/works"
 
-            async with session.get(url, params=params) as response:
-                if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 1)
-                    )
-                    if remaining < credits_required:
-                        raise CreditsExhaustedError(
-                            "Insufficient credits. Credits reset daily at midnight UTC."
+            attempt = 0
+            while True:
+                attempt += 1
+                async with session.get(url, params=params) as response:
+                    if response.status == 429:
+                        remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                        credits_required = int(
+                            response.headers.get("X-RateLimit-Credits-Required", 1)
                         )
-                    raise aiohttp.ClientResponseError(
-                        response.request_info,
-                        response.history,
-                        status=429,
-                        message="Rate limited",
-                    )
-                response.raise_for_status()
-                data = await response.json()
+                        if remaining < credits_required:
+                            raise CreditsExhaustedError(
+                                "Insufficient credits. Credits reset daily at midnight UTC."
+                            )
+                        if attempt >= max_attempts:
+                            raise aiohttp.ClientResponseError(
+                                response.request_info,
+                                response.history,
+                                status=429,
+                                message="Rate limited",
+                            )
+                        await asyncio.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+                        continue
+                    response.raise_for_status()
+                    data = await response.json()
+                    break
 
             results = data.get("results", [])
             works = [WorkItem.from_api_response(r) for r in results]
@@ -319,12 +334,8 @@ class OpenAlexAPIClient:
                     )
 
                 if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 0)
-                    )
+                    remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                    credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 0))
                     is_exhausted = remaining < credits_required
                     return DownloadResult(
                         work_id=work_id,
@@ -409,12 +420,8 @@ class OpenAlexAPIClient:
             if response.status == 404:
                 raise Exception(f"Work not found: {work_id}")
             if response.status == 429:
-                remaining = int(
-                    response.headers.get("X-RateLimit-Remaining", 0)
-                )
-                credits_required = int(
-                    response.headers.get("X-RateLimit-Credits-Required", 1)
-                )
+                remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 1))
                 if remaining < credits_required:
                     raise CreditsExhaustedError(
                         "Insufficient credits. Credits reset daily at midnight UTC."
@@ -427,6 +434,30 @@ class OpenAlexAPIClient:
                 )
             response.raise_for_status()
             return await response.json()
+
+    async def get_work_metadata_with_retry(
+        self,
+        work_id: str,
+        max_attempts: int = 3,
+        base_delay_seconds: float = 1.0,
+    ) -> dict:
+        """
+        Fetch full work metadata from the singleton API with bounded retry.
+
+        Retries HTTP 429 responses using a simple exponential backoff.
+        Credits exhaustion is treated as fatal and is not retried.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self.get_work_metadata(work_id)
+            except CreditsExhaustedError:
+                raise
+            except aiohttp.ClientResponseError as exc:
+                if exc.status != 429 or attempt >= max_attempts:
+                    raise
+                await asyncio.sleep(base_delay_seconds * (2 ** (attempt - 1)))
 
     async def resolve_dois(self, dois: list[str]) -> dict[str, str]:
         """

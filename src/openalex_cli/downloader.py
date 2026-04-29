@@ -111,8 +111,7 @@ class DownloadOrchestrator:
 
             # Start worker tasks
             workers = [
-                asyncio.create_task(self._download_worker(i))
-                for i in range(self.config.workers)
+                asyncio.create_task(self._download_worker(i)) for i in range(self.config.workers)
             ]
 
             # Start result processor
@@ -154,9 +153,7 @@ class DownloadOrchestrator:
             raise KeyboardInterrupt()
         self._shutdown_requested = True
         if self.progress_tracker:
-            self.progress_tracker.log_warning(
-                "Shutdown requested. Finishing current downloads..."
-            )
+            self.progress_tracker.log_warning("Shutdown requested. Finishing current downloads...")
 
     def _handle_credits_exhausted(self) -> None:
         """Stop all work when credits are exhausted."""
@@ -317,9 +314,7 @@ class DownloadOrchestrator:
                     await self._work_queue.put(work)
 
                 if self.progress_tracker:
-                    self.progress_tracker.log_info(
-                        f"Queued {total_count} works from sample..."
-                    )
+                    self.progress_tracker.log_info(f"Queued {total_count} works from sample...")
 
         except CreditsExhaustedError:
             self._handle_credits_exhausted()
@@ -344,12 +339,23 @@ class DownloadOrchestrator:
 
             try:
                 # Fetch work metadata from singleton API
-                metadata = await self.api_client.get_work_metadata(work_id)
+                metadata = await self.api_client.get_work_metadata_with_retry(work_id)
                 work = WorkItem.from_api_response(metadata)
                 await self._work_queue.put(work)
+            except CreditsExhaustedError:
+                self._handle_credits_exhausted()
+                break
             except Exception as e:
                 if self.progress_tracker:
                     self.progress_tracker.log_error(f"Error fetching metadata for {work_id}: {e}")
+                await self._results_queue.put(
+                    DownloadResult(
+                        work_id=work_id,
+                        format=ContentFormat.NONE,
+                        success=False,
+                        error=f"Failed to fetch metadata: {e}",
+                    )
+                )
 
     async def _download_worker(self, worker_id: int) -> None:
         """Worker that downloads metadata and optionally content."""
@@ -374,21 +380,24 @@ class DownloadOrchestrator:
                     filename_base = doi_to_filename(orig)
 
             # Always save full metadata (fetch from singleton API)
+            meta_content = b""
             try:
-                full_metadata = await self.api_client.get_work_metadata(work.work_id)
-                meta_path = str(
-                    work_id_to_path(filename_base, "json", nested=self.config.nested)
-                )
+                full_metadata = await self.api_client.get_work_metadata_with_retry(work.work_id)
+                meta_path = str(work_id_to_path(filename_base, "json", nested=self.config.nested))
                 meta_content = json.dumps(full_metadata, indent=2).encode()
                 await self.storage.save(meta_path, meta_content, "application/json")
             except CreditsExhaustedError:
                 self._handle_credits_exhausted()
                 break
             except Exception as e:
-                if self.progress_tracker:
-                    self.progress_tracker.log_warning(
-                        f"Failed to fetch metadata for {work.work_id}: {e}"
-                    )
+                result = DownloadResult(
+                    work_id=work.work_id,
+                    format=ContentFormat.NONE,
+                    success=False,
+                    error=f"Failed to fetch metadata: {e}",
+                )
+                await self._results_queue.put(result)
+                continue
 
             # If no content requested, we're done with this work
             if self.config.content_format == ContentFormat.NONE:
