@@ -15,6 +15,13 @@ class _DummyProgress:
     def log_warning(self, message: str) -> None:
         self.last_warning = message
 
+    def initialize_totals(
+        self,
+        starting_completed: int,
+        expected_total_works: int | None,
+    ) -> None:
+        self.last_totals = (starting_completed, expected_total_works)
+
     def update_pagination(self, pages: int, cursor: str | None) -> None:
         self.last_pagination = (pages, cursor)
 
@@ -306,7 +313,7 @@ async def test_restart_after_page_register_replays_from_disk_and_converges(tmp_p
     monkeypatch.delenv("OPENALEX_FAILPOINTS")
 
     second = DownloadOrchestrator(config)
-    second._setup_checkpoint()
+    await second._setup_checkpoint()
     fetches: list[str] = []
     second.api_client.close = _async_noop  # type: ignore[method-assign]
     second.storage.close = _async_noop  # type: ignore[method-assign]
@@ -379,7 +386,7 @@ async def test_restart_after_result_record_replays_only_remaining_work(tmp_path,
     monkeypatch.delenv("OPENALEX_FAILPOINTS")
 
     second = DownloadOrchestrator(config)
-    second._setup_checkpoint()
+    await second._setup_checkpoint()
     fetches: list[str] = []
     second.api_client.close = _async_noop  # type: ignore[method-assign]
     second.storage.close = _async_noop  # type: ignore[method-assign]
@@ -549,3 +556,135 @@ async def test_retry_failed_does_not_invoke_page_tracker(tmp_path):
     orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
 
     await orchestrator._run_failed_retry_phase()
+
+
+@pytest.mark.asyncio
+async def test_setup_checkpoint_prefetches_total_count_for_new_filter_run(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        filter_str="publication_year:2024",
+        workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.progress_tracker = cast(ProgressTracker, _DummyProgress())
+
+    calls: list[str | None] = []
+
+    async def fake_get_work_count(
+        filter_str: str | None = None, content_format: ContentFormat = ContentFormat.NONE
+    ) -> int:
+        calls.append(filter_str)
+        assert content_format == ContentFormat.NONE
+        return 321
+
+    orchestrator.api_client.get_work_count = fake_get_work_count  # type: ignore[method-assign]
+
+    checkpoint = await orchestrator._setup_checkpoint()
+
+    assert checkpoint is not None
+    assert checkpoint.expected_total_works == 321
+    assert calls == ["publication_year:2024"]
+
+
+@pytest.mark.asyncio
+async def test_setup_checkpoint_reuses_stored_total_on_resume(tmp_path):
+    manager = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    manager.checkpoint_manager.create(
+        filter_str="publication_year:2024",
+        content_format="none",
+        expected_total_works=456,
+    )
+
+    orchestrator = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    orchestrator.progress_tracker = cast(ProgressTracker, _DummyProgress())
+
+    async def fail_get_work_count(*args, **kwargs) -> int:
+        del args, kwargs
+        raise AssertionError("count preflight should not run on resume")
+
+    orchestrator.api_client.get_work_count = fail_get_work_count  # type: ignore[method-assign]
+
+    checkpoint = await orchestrator._setup_checkpoint()
+
+    assert checkpoint is not None
+    assert checkpoint.expected_total_works == 456
+
+
+@pytest.mark.asyncio
+async def test_setup_checkpoint_backfills_missing_total_on_resume(tmp_path):
+    existing = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    existing.checkpoint_manager.create(
+        filter_str="publication_year:2024",
+        content_format="none",
+        expected_total_works=None,
+    )
+
+    orchestrator = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    orchestrator.progress_tracker = cast(ProgressTracker, _DummyProgress())
+
+    calls: list[str | None] = []
+
+    async def fake_get_work_count(
+        filter_str: str | None = None, content_format: ContentFormat = ContentFormat.NONE
+    ) -> int:
+        calls.append(filter_str)
+        assert content_format == ContentFormat.NONE
+        return 654
+
+    orchestrator.api_client.get_work_count = fake_get_work_count  # type: ignore[method-assign]
+
+    checkpoint = await orchestrator._setup_checkpoint()
+
+    assert checkpoint is not None
+    assert checkpoint.expected_total_works == 654
+    assert calls == ["publication_year:2024"]
+
+
+def test_progress_tracker_initializes_known_total(tmp_path):
+    tracker = ProgressTracker(output_dir=tmp_path, quiet=True, verbose=False)
+
+    tracker.initialize_totals(starting_completed=100, expected_total_works=250)
+    tracker.update_download("W1", success=True, file_size=100)
+
+    assert tracker.stats.starting_completed == 100
+    assert tracker.stats.expected_total_works == 250
+    assert "101 / 250" in tracker._format_stats()

@@ -30,6 +30,7 @@ class Checkpoint:
     # Filter and format used for this download
     filter_str: str | None = None
     content_format: str = "pdf"
+    expected_total_works: int | None = None
 
     # Pagination state
     current_cursor: str = "*"
@@ -49,6 +50,7 @@ class Checkpoint:
         return {
             "filter_str": self.filter_str,
             "content_format": self.content_format,
+            "expected_total_works": self.expected_total_works,
             "current_cursor": self.current_cursor,
             "pages_completed": self.pages_completed,
             "completed_work_ids": list(self.completed_work_ids),
@@ -63,6 +65,7 @@ class Checkpoint:
         return cls(
             filter_str=data.get("filter_str"),
             content_format=data.get("content_format", "pdf"),
+            expected_total_works=data.get("expected_total_works"),
             current_cursor=data.get("current_cursor", "*"),
             pages_completed=data.get("pages_completed", 0),
             completed_work_ids=set(data.get("completed_work_ids", [])),
@@ -119,11 +122,13 @@ class CheckpointManager:
         self,
         filter_str: str | None = None,
         content_format: str = "pdf",
+        expected_total_works: int | None = None,
     ) -> Checkpoint:
         """Create a new checkpoint."""
         self._checkpoint = Checkpoint(
             filter_str=filter_str,
             content_format=content_format,
+            expected_total_works=expected_total_works,
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._save()

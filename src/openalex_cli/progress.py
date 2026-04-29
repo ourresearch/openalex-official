@@ -7,6 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.live import Live
@@ -37,6 +38,8 @@ class ProgressStats:
     start_time: float = 0.0
     pages_completed: int = 0
     current_cursor: str | None = None
+    expected_total_works: int | None = None
+    starting_completed: int = 0
 
 
 class ProgressTracker:
@@ -164,6 +167,20 @@ class ProgressTracker:
         self.stats.current_cursor = cursor
         self._refresh_display()
 
+    def initialize_totals(
+        self,
+        starting_completed: int,
+        expected_total_works: int | None,
+    ) -> None:
+        """Initialize total progress tracking for a new or resumed run."""
+        self.stats.starting_completed = starting_completed
+        self.stats.expected_total_works = expected_total_works
+
+        if self._progress and self._task_id is not None and expected_total_works is not None:
+            self._progress.update(self._task_id, total=expected_total_works)
+
+        self._refresh_display()
+
     def log_info(self, message: str) -> None:
         """Log an info message."""
         self._logger.info(message)
@@ -186,7 +203,12 @@ class ProgressTracker:
         """Refresh the Rich display."""
         if self._live and self._progress and self._task_id is not None:
             stats = self._format_stats()
-            self._progress.update(self._task_id, stats=stats)
+            update_kwargs: dict[str, Any] = {"stats": stats}
+            if self.stats.expected_total_works is not None:
+                update_kwargs["completed"] = (
+                    self.stats.starting_completed + self.stats.total_downloaded
+                )
+            self._progress.update(self._task_id, **update_kwargs)
             self._live.update(self._make_display())
 
     def _make_display(self) -> Panel:
@@ -217,6 +239,23 @@ class ProgressTracker:
             "Pages:",
             f"{self.stats.pages_completed} completed",
         )
+
+        if self.stats.expected_total_works is not None:
+            completed = self.stats.starting_completed + self.stats.total_downloaded
+            remaining = max(self.stats.expected_total_works - completed, 0)
+            percent = (
+                completed / self.stats.expected_total_works
+                if self.stats.expected_total_works
+                else 0
+            )
+            table.add_row(
+                "Progress:",
+                f"{format_count(completed)} / {format_count(self.stats.expected_total_works)} ({percent:.1%})",
+            )
+            table.add_row(
+                "Remaining:",
+                f"{format_count(remaining)} works",
+            )
 
         # API health
         if self._rate_state:
@@ -262,6 +301,13 @@ class ProgressTracker:
         """Format stats for the progress bar."""
         elapsed = time.time() - self.stats.start_time
         files_per_sec = self.stats.total_downloaded / elapsed if elapsed > 0 else 0
+        if self.stats.expected_total_works is not None:
+            completed = self.stats.starting_completed + self.stats.total_downloaded
+            return (
+                f"{format_count(completed)} / {format_count(self.stats.expected_total_works)} • "
+                f"{format_count(self.stats.total_failed)} failed • "
+                f"{files_per_sec:.1f}/s"
+            )
         return (
             f"{format_count(self.stats.total_downloaded)} OK • "
             f"{format_count(self.stats.total_failed)} failed • "

@@ -133,6 +133,37 @@ class OpenAlexAPIClient:
                 rate_limit_remaining=rate_limit_remaining,
             )
 
+    async def get_work_count(
+        self,
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+    ) -> int:
+        """Get a lightweight total count for a filtered works query."""
+        session = await self._get_session()
+
+        full_filter = filter_str
+        if content_format != ContentFormat.NONE:
+            if content_format in (ContentFormat.PDF, ContentFormat.BOTH):
+                content_filter = "has_content.pdf:true"
+            else:
+                content_filter = "has_content.grobid_xml:true"
+            full_filter = f"{content_filter},{filter_str}" if filter_str else content_filter
+
+        params: dict[str, str | int] = {
+            "per-page": 1,
+            "api_key": self.api_key,
+        }
+        if full_filter:
+            params["filter"] = full_filter
+
+        url = f"{self.WORKS_API_BASE}/works"
+        async with session.get(url, params=params) as response:
+            response.raise_for_status()
+            data = cast(dict[str, Any], await response.json())
+
+        meta = cast(dict[str, Any], data.get("meta", {}))
+        return int(meta.get("count", 0))
+
     async def list_works(
         self,
         filter_str: str | None = None,

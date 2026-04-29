@@ -122,9 +122,15 @@ class DownloadOrchestrator:
 
         try:
             # Initialize or resume checkpoint
-            checkpoint = self._setup_checkpoint()
+            checkpoint = await self._setup_checkpoint()
             if checkpoint is None:
                 return
+
+            if self.progress_tracker:
+                self.progress_tracker.initialize_totals(
+                    starting_completed=len(checkpoint.completed_work_ids),
+                    expected_total_works=checkpoint.expected_total_works,
+                )
 
             if self._page_tracking_enabled:
                 commit = self.page_tracker.startup_reconcile()
@@ -221,7 +227,16 @@ class DownloadOrchestrator:
         """Return worker count for the failed-ID retry phase."""
         return self.config.retry_workers or 10
 
-    def _setup_checkpoint(self):
+    def _should_prefetch_total_count(self) -> bool:
+        """Return True when this run should do a one-shot total count preflight."""
+        return (
+            self.config.content_format == ContentFormat.NONE
+            and self.config.filter_str is not None
+            and not self.config.sample
+            and not self.config.work_ids
+        )
+
+    async def _setup_checkpoint(self):
         """Set up or resume checkpoint."""
         # Check for existing checkpoint
         if self.checkpoint_manager.exists() and not self.config.fresh:
@@ -248,18 +263,62 @@ class DownloadOrchestrator:
                     return None
 
                 if self.config.resume:
+                    if (
+                        existing.expected_total_works is None
+                        and self._should_prefetch_total_count()
+                    ):
+                        try:
+                            existing.expected_total_works = await self.api_client.get_work_count(
+                                filter_str=self.config.filter_str,
+                                content_format=self.config.content_format,
+                            )
+                            self.checkpoint_manager.force_save()
+                            if self.progress_tracker:
+                                self.progress_tracker.log_info(
+                                    "Backfilled expected total works for this existing checkpoint: "
+                                    f"{existing.expected_total_works:,}"
+                                )
+                        except Exception as e:
+                            if self.progress_tracker:
+                                self.progress_tracker.log_warning(
+                                    "Could not backfill total work count for this existing checkpoint: "
+                                    f"{e}"
+                                )
+
                     if self.progress_tracker:
                         stats = existing.stats
+                        expected_total = existing.expected_total_works
+                        total_suffix = (
+                            f" of {expected_total:,} expected" if expected_total is not None else ""
+                        )
                         self.progress_tracker.log_info(
                             f"Resuming from checkpoint: {stats.total_downloaded} downloaded, "
-                            f"{stats.total_failed} failed"
+                            f"{stats.total_failed} failed{total_suffix}"
                         )
                     return existing
 
         # Create new checkpoint
+        expected_total_works = None
+        if self._should_prefetch_total_count():
+            try:
+                expected_total_works = await self.api_client.get_work_count(
+                    filter_str=self.config.filter_str,
+                    content_format=self.config.content_format,
+                )
+                if self.progress_tracker:
+                    self.progress_tracker.log_info(
+                        f"Estimated total works for this download: {expected_total_works:,}"
+                    )
+            except Exception as e:
+                if self.progress_tracker:
+                    self.progress_tracker.log_warning(
+                        f"Could not determine total work count for progress estimation: {e}"
+                    )
+
         return self.checkpoint_manager.create(
             filter_str=self.config.filter_str,
             content_format=self.config.content_format.value,
+            expected_total_works=expected_total_works,
         )
 
     async def _produce_work(self) -> None:

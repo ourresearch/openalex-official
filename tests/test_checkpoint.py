@@ -10,6 +10,7 @@ class TestCheckpoint:
         checkpoint = Checkpoint(
             filter_str="publication_year:2024",
             content_format="pdf",
+            expected_total_works=12345,
             current_cursor="abc123",
             pages_completed=5,
             completed_work_ids={"W1", "W2", "W3"},
@@ -23,6 +24,7 @@ class TestCheckpoint:
 
         assert restored.filter_str == "publication_year:2024"
         assert restored.content_format == "pdf"
+        assert restored.expected_total_works == 12345
         assert restored.current_cursor == "abc123"
         assert restored.pages_completed == 5
         assert restored.completed_work_ids == {"W1", "W2", "W3"}
@@ -40,9 +42,11 @@ class TestCheckpointManager:
             checkpoint = manager.create(
                 filter_str="type:article",
                 content_format="xml",
+                expected_total_works=999,
             )
             assert checkpoint.filter_str == "type:article"
             assert checkpoint.content_format == "xml"
+            assert checkpoint.expected_total_works == 999
 
             # Load should return same data
             manager2 = CheckpointManager(tmpdir)
@@ -50,6 +54,7 @@ class TestCheckpointManager:
             assert loaded is not None
             assert loaded.filter_str == "type:article"
             assert loaded.content_format == "xml"
+            assert loaded.expected_total_works == 999
 
     def test_mark_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,6 +145,7 @@ class TestCheckpointManager:
             # Verify saved to disk
             manager2 = CheckpointManager(tmpdir)
             loaded = manager2.load()
+            assert loaded is not None
             assert len(loaded.completed_work_ids) == 100
 
     def test_commit_page(self):
