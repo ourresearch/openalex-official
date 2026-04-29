@@ -1,12 +1,8 @@
 """Tests for checkpoint system."""
 
-import json
 import tempfile
-from pathlib import Path
 
-import pytest
-
-from openalex_cli.checkpoint import Checkpoint, CheckpointManager, DownloadStats
+from openalex_cli.checkpoint import Checkpoint, CheckpointManager
 
 
 class TestCheckpoint:
@@ -111,3 +107,23 @@ class TestCheckpointManager:
             manager2 = CheckpointManager(tmpdir)
             loaded = manager2.load()
             assert len(loaded.completed_work_ids) == 100
+
+    def test_commit_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            manager.create(filter_str="type:article", content_format="none")
+
+            manager.commit_page(
+                cursor="cursor_abc",
+                completed_entries=[("W1", 100, 0), ("W2", 200, 0)],
+                failed_work_ids=["W3"],
+            )
+
+            checkpoint = manager.get()
+            assert checkpoint.current_cursor == "cursor_abc"
+            assert checkpoint.pages_completed == 1
+            assert checkpoint.completed_work_ids == {"W1", "W2"}
+            assert checkpoint.failed_work_ids == {"W3"}
+            assert checkpoint.stats.total_downloaded == 2
+            assert checkpoint.stats.total_failed == 1
+            assert checkpoint.stats.total_bytes == 300

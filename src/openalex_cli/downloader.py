@@ -6,12 +6,14 @@ import asyncio
 import json
 import signal
 import time
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 
 from .api_client import CreditsExhaustedError, DownloadResult, OpenAlexAPIClient, WorkItem
 from .checkpoint import CheckpointManager
+from .fault_injection import FailureInjector
+from .page_tracker import PageTracker
 from .progress import ProgressTracker
 from .rate_limiter import AdaptiveRateLimiter
 from .storage import LocalStorage, S3Storage, StorageBackend
@@ -41,6 +43,14 @@ class DownloadConfig:
     seed: int | None = None  # Seed for reproducible random samples
 
 
+@dataclass
+class QueuedWork:
+    """Work queued for download with optional page-tracking context."""
+
+    work: WorkItem
+    page_seq: int | None = None
+
+
 class DownloadOrchestrator:
     """Orchestrates the bulk download process."""
 
@@ -56,12 +66,18 @@ class DownloadOrchestrator:
         self.api_client = OpenAlexAPIClient(api_key=config.api_key)
         self.rate_limiter = AdaptiveRateLimiter(max_workers=config.workers)
         self.checkpoint_manager = CheckpointManager(config.output_path)
+        self.page_tracker = PageTracker(config.output_path, self.checkpoint_manager)
+        self.failure_injector = FailureInjector()
         self.progress_tracker: ProgressTracker | None = None
 
         # Initialize storage backend
         if config.storage_type == StorageType.S3:
             if not config.s3_bucket:
                 raise ValueError("S3 bucket required for S3 storage")
+            if S3Storage is None:
+                raise RuntimeError(
+                    "S3 storage requires the optional aiobotocore dependency to be installed"
+                )
             self.storage: StorageBackend = S3Storage(
                 bucket=config.s3_bucket,
                 prefix=config.s3_prefix,
@@ -72,8 +88,13 @@ class DownloadOrchestrator:
         # Control flags
         self._shutdown_requested = False
         self._credits_exhausted = False
+        self._page_tracking_enabled = (
+            self.config.content_format == ContentFormat.NONE
+            and not self.config.sample
+            and not self.config.work_ids
+        )
         # Queues are created in run() to ensure they're in the correct event loop
-        self._work_queue: asyncio.Queue[WorkItem | None] | None = None
+        self._work_queue: asyncio.Queue[QueuedWork | None] | None = None
         self._results_queue: asyncio.Queue[DownloadResult] | None = None
 
     async def run(self, progress_tracker: ProgressTracker | None = None) -> None:
@@ -88,18 +109,27 @@ class DownloadOrchestrator:
         # Windows event loops do not support add_signal_handler().
         loop = asyncio.get_running_loop()
         signal_handlers_installed = False
-        try:
-            for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
                 loop.add_signal_handler(sig, self._request_shutdown)
-            signal_handlers_installed = True
-        except NotImplementedError:
-            pass
+                signal_handlers_installed = True
+            except NotImplementedError:
+                signal_handlers_installed = False
+                break
 
         try:
             # Initialize or resume checkpoint
             checkpoint = self._setup_checkpoint()
             if checkpoint is None:
                 return
+
+            if self._page_tracking_enabled:
+                commit = self.page_tracker.startup_reconcile()
+                if self.progress_tracker and commit.committed_pages:
+                    self.progress_tracker.update_pagination(
+                        pages=commit.pages_completed,
+                        cursor=commit.current_cursor,
+                    )
 
             # Log start
             if self.progress_tracker:
@@ -234,12 +264,27 @@ class DownloadOrchestrator:
         warned_about_flat = False
         total_count = 0
 
+        if self._page_tracking_enabled:
+            assert self._work_queue is not None
+            for replay in self.page_tracker.replay_pending_work():
+                await self._work_queue.put(
+                    QueuedWork(
+                        work=WorkItem(work_id=replay.work_id),
+                        page_seq=replay.page_seq,
+                    )
+                )
+                self.failure_injector.hit("after_replay_enqueue")
+            cursor = self.page_tracker.resume_cursor(cursor) or cursor
+
+        page_iter = self.api_client.list_works(
+            filter_str=self.config.filter_str,
+            content_format=self.config.content_format,
+            cursor=cursor,
+        )
+        closable_page_iter = page_iter if isinstance(page_iter, AsyncGenerator) else None
+
         try:
-            async for works, next_cursor in self.api_client.list_works(
-                filter_str=self.config.filter_str,
-                content_format=self.config.content_format,
-                cursor=cursor,
-            ):
+            async for works, next_cursor in page_iter:
                 if self._shutdown_requested:
                     break
 
@@ -257,39 +302,59 @@ class DownloadOrchestrator:
                     )
                     warned_about_flat = True
 
-                for work in works:
+                page_seq: int | None = None
+                queueable_works = [
+                    work for work in works if not self.checkpoint_manager.is_completed(work.work_id)
+                ]
+                work_ids = [work.work_id for work in queueable_works]
+                if self._page_tracking_enabled and work_ids:
+                    page_seq = self.page_tracker.register_page(
+                        cursor_in=cursor,
+                        cursor_out=next_cursor,
+                        work_ids=work_ids,
+                    ).seq
+                    self.failure_injector.hit("after_page_register")
+
+                for work in queueable_works:
                     if self._shutdown_requested:
                         break
 
-                    # Skip already completed
-                    if self.checkpoint_manager.is_completed(work.work_id):
-                        continue
+                    assert self._work_queue is not None
+                    await self._work_queue.put(QueuedWork(work=work, page_seq=page_seq))
 
-                    await self._work_queue.put(work)
+                if not self._page_tracking_enabled:
+                    self.checkpoint_manager.update_cursor(next_cursor)
 
-                # Update cursor checkpoint
-                self.checkpoint_manager.update_cursor(next_cursor)
-
-                if self.progress_tracker:
+                if self.progress_tracker and not self._page_tracking_enabled:
                     self.progress_tracker.update_pagination(
                         pages=checkpoint.pages_completed,
                         cursor=next_cursor,
                     )
+
+                cursor = next_cursor or "*"
 
         except CreditsExhaustedError:
             self._handle_credits_exhausted()
         except Exception as e:
             if self.progress_tracker:
                 self.progress_tracker.log_error(f"Error listing works: {e}")
+            raise
+        finally:
+            if closable_page_iter is not None:
+                await closable_page_iter.aclose()
 
     async def _produce_work_from_sample(self) -> None:
         """Queue work items from a random sample (page-based pagination)."""
         total_count = 0
         warned_about_flat = False
+        sample_size = self.config.sample
+
+        if sample_size is None:
+            return
 
         try:
             async for works in self.api_client.list_works_sample(
-                sample_size=self.config.sample,
+                sample_size=sample_size,
                 seed=self.config.seed,
                 filter_str=self.config.filter_str,
                 content_format=self.config.content_format,
@@ -318,7 +383,8 @@ class DownloadOrchestrator:
                     if self.checkpoint_manager.is_completed(work.work_id):
                         continue
 
-                    await self._work_queue.put(work)
+                    assert self._work_queue is not None
+                    await self._work_queue.put(QueuedWork(work=work))
 
                 if self.progress_tracker:
                     self.progress_tracker.log_info(f"Queued {total_count} works from sample...")
@@ -348,13 +414,15 @@ class DownloadOrchestrator:
                 # Fetch work metadata from singleton API
                 metadata = await self.api_client.get_work_metadata_with_retry(work_id)
                 work = WorkItem.from_api_response(metadata)
-                await self._work_queue.put(work)
+                assert self._work_queue is not None
+                await self._work_queue.put(QueuedWork(work=work))
             except CreditsExhaustedError:
                 self._handle_credits_exhausted()
                 break
             except Exception as e:
                 if self.progress_tracker:
                     self.progress_tracker.log_error(f"Error fetching metadata for {work_id}: {e}")
+                assert self._results_queue is not None
                 await self._results_queue.put(
                     DownloadResult(
                         work_id=work_id,
@@ -368,12 +436,15 @@ class DownloadOrchestrator:
         """Worker that downloads metadata and optionally content."""
         while not self._shutdown_requested:
             try:
-                work = await asyncio.wait_for(self._work_queue.get(), timeout=1.0)
+                assert self._work_queue is not None
+                queued = await asyncio.wait_for(self._work_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
-            if work is None:
+            if queued is None:
                 break
+
+            work = queued.work
 
             # Determine filename base: use original DOI if provided, else work_id
             filename_base = work.work_id
@@ -397,13 +468,16 @@ class DownloadOrchestrator:
                 self._handle_credits_exhausted()
                 break
             except Exception as e:
-                result = DownloadResult(
-                    work_id=work.work_id,
-                    format=ContentFormat.NONE,
-                    success=False,
-                    error=f"Failed to fetch metadata: {e}",
+                assert self._results_queue is not None
+                await self._results_queue.put(
+                    DownloadResult(
+                        work_id=work.work_id,
+                        format=ContentFormat.NONE,
+                        success=False,
+                        error=f"Failed to fetch metadata: {e}",
+                        page_seq=queued.page_seq,
+                    )
                 )
-                await self._results_queue.put(result)
                 continue
 
             # If no content requested, we're done with this work
@@ -413,20 +487,26 @@ class DownloadOrchestrator:
                     work_id=work.work_id,
                     format=ContentFormat.NONE,
                     success=True,
-                    file_size=len(meta_content) if meta_content else 0,
+                    file_size=len(meta_content),
                     credits_cost=0,  # Singleton API is free
+                    page_seq=queued.page_seq,
                 )
+                assert self._results_queue is not None
                 await self._results_queue.put(result)
                 continue
 
             # Determine content formats to download
             formats = []
-            if self.config.content_format in (ContentFormat.PDF, ContentFormat.BOTH):
-                if work.has_pdf:
-                    formats.append(ContentFormat.PDF)
-            if self.config.content_format in (ContentFormat.XML, ContentFormat.BOTH):
-                if work.has_xml:
-                    formats.append(ContentFormat.XML)
+            if (
+                self.config.content_format in (ContentFormat.PDF, ContentFormat.BOTH)
+                and work.has_pdf
+            ):
+                formats.append(ContentFormat.PDF)
+            if (
+                self.config.content_format in (ContentFormat.XML, ContentFormat.BOTH)
+                and work.has_xml
+            ):
+                formats.append(ContentFormat.XML)
 
             # If no content available for requested formats, report success (metadata was saved)
             if not formats:
@@ -434,9 +514,11 @@ class DownloadOrchestrator:
                     work_id=work.work_id,
                     format=self.config.content_format,
                     success=True,
-                    file_size=len(meta_content) if meta_content else 0,
+                    file_size=len(meta_content),
                     credits_cost=0,
+                    page_seq=queued.page_seq,
                 )
+                assert self._results_queue is not None
                 await self._results_queue.put(result)
                 continue
 
@@ -470,6 +552,8 @@ class DownloadOrchestrator:
                         )
                         await self.storage.save(path, result.content, content_type)
 
+                    result.page_seq = queued.page_seq
+                    assert self._results_queue is not None
                     await self._results_queue.put(result)
 
                 except Exception as e:
@@ -478,7 +562,9 @@ class DownloadOrchestrator:
                         format=fmt,
                         success=False,
                         error=str(e),
+                        page_seq=queued.page_seq,
                     )
+                    assert self._results_queue is not None
                     await self._results_queue.put(result)
 
                 finally:
@@ -487,19 +573,37 @@ class DownloadOrchestrator:
     async def _process_results(self) -> None:
         """Process download results and update progress."""
         while True:
+            assert self._results_queue is not None
             result = await self._results_queue.get()
 
             if result.work_id == "__DONE__":
                 break
 
-            if result.success:
-                self.checkpoint_manager.mark_completed(
-                    result.work_id,
-                    result.file_size,
-                    result.credits_cost,
+            if self._page_tracking_enabled and result.page_seq is not None:
+                commit = self.page_tracker.record_work_result(
+                    page_seq=result.page_seq,
+                    work_id=result.work_id,
+                    success=result.success,
+                    file_size=result.file_size,
+                    credits=result.credits_cost,
+                    error=result.error,
                 )
+                self.failure_injector.hit("after_result_record")
+                if self.progress_tracker and commit.committed_pages:
+                    self.progress_tracker.update_pagination(
+                        pages=commit.pages_completed,
+                        cursor=commit.current_cursor,
+                    )
+                    self.failure_injector.hit("after_page_commit")
             else:
-                self.checkpoint_manager.mark_failed(result.work_id)
+                if result.success:
+                    self.checkpoint_manager.mark_completed(
+                        result.work_id,
+                        result.file_size,
+                        result.credits_cost,
+                    )
+                else:
+                    self.checkpoint_manager.mark_failed(result.work_id)
 
             if self.progress_tracker:
                 self.progress_tracker.update_download(

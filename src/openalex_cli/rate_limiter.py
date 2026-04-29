@@ -190,7 +190,7 @@ class AdaptiveRateLimiter:
         Returns the actual wait time in seconds.
         """
         wait_time = min(
-            self._current_backoff * (self.BACKOFF_MULTIPLIER ** self._consecutive_errors),
+            self._current_backoff * (self.BACKOFF_MULTIPLIER**self._consecutive_errors),
             self.MAX_BACKOFF,
         )
         await asyncio.sleep(wait_time)
@@ -219,6 +219,4 @@ class AdaptiveRateLimiter:
     def should_continue(self) -> bool:
         """Check if we should continue making requests."""
         # Stop if rate limit is exhausted
-        if self._rate_limit_remaining is not None and self._rate_limit_remaining <= 0:
-            return False
-        return True
+        return not (self._rate_limit_remaining is not None and self._rate_limit_remaining <= 0)

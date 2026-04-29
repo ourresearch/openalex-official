@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from ..state_io import atomic_write_bytes
 from .base import StorageBackend
 
 
@@ -37,7 +38,7 @@ class LocalStorage(StorageBackend):
 
     def _write_file(self, path: Path, content: bytes) -> None:
         """Synchronous file write."""
-        path.write_bytes(content)
+        atomic_write_bytes(path, content)
 
     async def exists(self, path: str) -> bool:
         """Check if a file exists."""
