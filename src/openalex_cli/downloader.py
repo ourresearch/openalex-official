@@ -84,10 +84,16 @@ class DownloadOrchestrator:
         self._work_queue = asyncio.Queue()
         self._results_queue = asyncio.Queue()
 
-        # Set up signal handlers for graceful shutdown
+        # Set up signal handlers for graceful shutdown.
+        # Windows event loops do not support add_signal_handler().
         loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._request_shutdown)
+        signal_handlers_installed = False
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._request_shutdown)
+            signal_handlers_installed = True
+        except NotImplementedError:
+            pass
 
         try:
             # Initialize or resume checkpoint
@@ -111,8 +117,7 @@ class DownloadOrchestrator:
 
             # Start worker tasks
             workers = [
-                asyncio.create_task(self._download_worker(i))
-                for i in range(self.config.workers)
+                asyncio.create_task(self._download_worker(i)) for i in range(self.config.workers)
             ]
 
             # Start result processor
@@ -143,9 +148,10 @@ class DownloadOrchestrator:
             await self.api_client.close()
             await self.storage.close()
 
-            # Remove signal handlers
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.remove_signal_handler(sig)
+            # Remove signal handlers only if they were installed.
+            if signal_handlers_installed:
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.remove_signal_handler(sig)
 
     def _request_shutdown(self) -> None:
         """Handle shutdown signal."""
@@ -154,9 +160,7 @@ class DownloadOrchestrator:
             raise KeyboardInterrupt()
         self._shutdown_requested = True
         if self.progress_tracker:
-            self.progress_tracker.log_warning(
-                "Shutdown requested. Finishing current downloads..."
-            )
+            self.progress_tracker.log_warning("Shutdown requested. Finishing current downloads...")
 
     def _handle_credits_exhausted(self) -> None:
         """Stop all work when credits are exhausted."""
@@ -317,9 +321,7 @@ class DownloadOrchestrator:
                     await self._work_queue.put(work)
 
                 if self.progress_tracker:
-                    self.progress_tracker.log_info(
-                        f"Queued {total_count} works from sample..."
-                    )
+                    self.progress_tracker.log_info(f"Queued {total_count} works from sample...")
 
         except CreditsExhaustedError:
             self._handle_credits_exhausted()
@@ -376,9 +378,7 @@ class DownloadOrchestrator:
             # Always save full metadata (fetch from singleton API)
             try:
                 full_metadata = await self.api_client.get_work_metadata(work.work_id)
-                meta_path = str(
-                    work_id_to_path(filename_base, "json", nested=self.config.nested)
-                )
+                meta_path = str(work_id_to_path(filename_base, "json", nested=self.config.nested))
                 meta_content = json.dumps(full_metadata, indent=2).encode()
                 await self.storage.save(meta_path, meta_content, "application/json")
             except CreditsExhaustedError:
