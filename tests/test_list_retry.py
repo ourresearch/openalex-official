@@ -67,7 +67,10 @@ async def test_list_works_retries_429(monkeypatch):
     async def fake_sleep(_: float):
         return None
 
-    monkeypatch.setattr(client, "_get_session", lambda: FakeSession())
+    async def fake_get_session():
+        return FakeSession()
+
+    monkeypatch.setattr(client, "_get_session", fake_get_session)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     pages = []
@@ -120,7 +123,10 @@ async def test_list_works_raises_credits_exhausted_without_retry(monkeypatch):
             calls["count"] += 1
             return FakeResponse()
 
-    monkeypatch.setattr(client, "_get_session", lambda: FakeSession())
+    async def fake_get_session():
+        return FakeSession()
+
+    monkeypatch.setattr(client, "_get_session", fake_get_session)
 
     with pytest.raises(CreditsExhaustedError):
         async for _works, _cursor in client.list_works(

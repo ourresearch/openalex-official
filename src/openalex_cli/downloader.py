@@ -174,6 +174,8 @@ class DownloadOrchestrator:
 
         finally:
             # Clean up
+            if self._page_tracking_enabled:
+                self.page_tracker.flush_dirty_manifests()
             self.checkpoint_manager.force_save()
             await self.api_client.close()
             await self.storage.close()
@@ -588,6 +590,7 @@ class DownloadOrchestrator:
                     credits=result.credits_cost,
                     error=result.error,
                 )
+                self.page_tracker.flush_manifest(result.page_seq)
                 self.failure_injector.hit("after_result_record")
                 if self.progress_tracker and commit.committed_pages:
                     self.progress_tracker.update_pagination(

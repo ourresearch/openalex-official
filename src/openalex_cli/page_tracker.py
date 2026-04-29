@@ -154,14 +154,21 @@ class PageStateStore:
 class PageTracker:
     """Own durable state for uncommitted metadata-only pages."""
 
+    FLUSH_EVERY_RESULTS = 50
+
     def __init__(self, output_dir: str | Path, checkpoint_manager: CheckpointManager):
         self.checkpoint_manager = checkpoint_manager
         self.state_store = PageStateStore(output_dir)
+        self._manifest_cache: dict[int, PageManifest] = {}
+        self._dirty_manifests: set[int] = set()
+        self._result_updates_since_flush = 0
 
     def startup_reconcile(self) -> CommitOutcome:
-        for manifest in self.state_store.list_manifests():
+        self._reload_cache()
+        for manifest in list(self._ordered_manifests()):
             if self._manifest_is_already_committed(manifest):
                 self.state_store.delete_manifest(manifest.seq)
+                self._manifest_cache.pop(manifest.seq, None)
 
         return self._commit_ready_pages()
 
@@ -171,7 +178,7 @@ class PageTracker:
 
     def resume_cursor(self, default_cursor: str) -> str | None:
         """Return the cursor to use for fresh pagination after replay."""
-        manifests = self.state_store.list_manifests()
+        manifests = self._ordered_manifests()
         if not manifests:
             return default_cursor
         return manifests[-1].cursor_out
@@ -189,11 +196,14 @@ class PageTracker:
             work_ids=work_ids,
         )
         self.state_store.save_manifest(manifest)
+        self._manifest_cache[manifest.seq] = manifest
         return manifest
 
     def replay_pending_work(self) -> list[ReplayWorkItem]:
         replay: list[ReplayWorkItem] = []
-        for manifest in self.state_store.list_manifests():
+        for manifest in self._ordered_manifests():
+            if self._manifest_is_already_committed(manifest):
+                continue
             for work_id in manifest.pending_work_ids():
                 replay.append(ReplayWorkItem(page_seq=manifest.seq, work_id=work_id))
         return replay
@@ -221,27 +231,60 @@ class PageTracker:
             credits=credits,
             error=error,
         )
-        self.state_store.save_manifest(manifest)
+        self._dirty_manifests.add(page_seq)
+        self._result_updates_since_flush += 1
+        if self._result_updates_since_flush >= self.FLUSH_EVERY_RESULTS:
+            self.flush_dirty_manifests()
         return self._commit_ready_pages()
+
+    def flush_dirty_manifests(self) -> None:
+        """Persist all dirty manifest updates in sequence order."""
+        if not self._dirty_manifests:
+            return
+
+        for seq in sorted(self._dirty_manifests):
+            manifest = self._manifest_cache.get(seq)
+            if manifest is not None:
+                self.state_store.save_manifest(manifest)
+        self._dirty_manifests.clear()
+        self._result_updates_since_flush = 0
+
+    def flush_manifest(self, page_seq: int) -> None:
+        """Persist a single dirty manifest immediately if present."""
+        if page_seq not in self._dirty_manifests:
+            return
+
+        manifest = self._manifest_cache.get(page_seq)
+        if manifest is None:
+            return
+
+        self.state_store.save_manifest(manifest)
+        self._dirty_manifests.discard(page_seq)
+        if not self._dirty_manifests:
+            self._result_updates_since_flush = 0
 
     def _commit_ready_pages(self) -> CommitOutcome:
         committed_pages = 0
         checkpoint = self.checkpoint_manager.get()
 
-        for manifest in self.state_store.list_manifests():
+        for manifest in list(self._ordered_manifests()):
             if self._manifest_is_already_committed(manifest):
                 self.state_store.delete_manifest(manifest.seq)
+                self._manifest_cache.pop(manifest.seq, None)
                 continue
 
             if not manifest.is_terminal():
                 break
 
+            self._dirty_manifests.discard(manifest.seq)
+            self.state_store.save_manifest(manifest)
             self.checkpoint_manager.commit_page(
                 cursor=manifest.cursor_out,
                 completed_entries=manifest.completed_entries(),
                 failed_work_ids=manifest.failed_work_ids(),
             )
             self.state_store.delete_manifest(manifest.seq)
+            self._manifest_cache.pop(manifest.seq, None)
             committed_pages += 1
             checkpoint = self.checkpoint_manager.get()
 
@@ -258,7 +301,18 @@ class PageTracker:
         )
 
     def _load_manifest(self, seq: int) -> PageManifest | None:
-        for manifest in self.state_store.list_manifests():
-            if manifest.seq == seq:
-                return manifest
-        return None
+        manifest = self._manifest_cache.get(seq)
+        if manifest is not None:
+            return manifest
+
+        self._reload_cache()
+        return self._manifest_cache.get(seq)
+
+    def _ordered_manifests(self) -> list[PageManifest]:
+        if not self._manifest_cache:
+            self._reload_cache()
+        return [self._manifest_cache[seq] for seq in sorted(self._manifest_cache)]
+
+    def _reload_cache(self) -> None:
+        manifests = self.state_store.list_manifests()
+        self._manifest_cache = {manifest.seq: manifest for manifest in manifests}

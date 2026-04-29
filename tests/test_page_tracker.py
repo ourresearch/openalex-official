@@ -66,3 +66,27 @@ def test_resume_cursor_uses_highest_uncommitted_cursor_out(tmp_path):
     tracker.register_page("cursor-1", "cursor-2", ["W2"])
 
     assert tracker.resume_cursor("*") == "cursor-2"
+
+
+def test_record_work_result_batches_manifest_flushes(tmp_path):
+    manager = CheckpointManager(tmp_path)
+    manager.create(filter_str="type:article", content_format="none")
+    tracker = PageTracker(tmp_path, manager)
+    tracker.FLUSH_EVERY_RESULTS = 1000
+
+    page = tracker.register_page("*", "cursor-1", ["W1", "W2"])
+    writes: list[int] = []
+
+    original_save = tracker.state_store.save_manifest
+
+    def recording_save(manifest):
+        writes.append(manifest.seq)
+        original_save(manifest)
+
+    tracker.state_store.save_manifest = recording_save
+
+    tracker.record_work_result(page.seq, "W1", True, 10, 0, None)
+    assert writes == []
+
+    tracker.record_work_result(page.seq, "W2", True, 11, 0, None)
+    assert writes == [page.seq]

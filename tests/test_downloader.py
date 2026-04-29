@@ -368,9 +368,13 @@ async def test_restart_after_result_record_replays_only_remaining_work(tmp_path,
     with pytest.raises(RuntimeError, match="after_result_record"):
         await first._process_results()
 
-    manifest = first.page_tracker.state_store.list_manifests()[0]
-    assert manifest.work_states["W1"].state == "completed"
-    assert manifest.work_states["W2"].state == "pending"
+    cached_manifest = first.page_tracker._load_manifest(page.seq)
+    assert cached_manifest is not None
+    assert cached_manifest.work_states["W1"].state == "completed"
+    assert cached_manifest.work_states["W2"].state == "pending"
+
+    persisted_manifest = first.page_tracker.state_store.list_manifests()[0]
+    assert persisted_manifest.work_states["W1"].state == "completed"
 
     monkeypatch.delenv("OPENALEX_FAILPOINTS")
 
