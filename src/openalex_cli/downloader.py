@@ -6,11 +6,13 @@ import asyncio
 import json
 import signal
 import time
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Callable
 
 from .api_client import CreditsExhaustedError, DownloadResult, OpenAlexAPIClient, WorkItem
 from .checkpoint import CheckpointManager
+from .fault_injection import FailureInjector
 from .page_tracker import PageTracker
 from .progress import ProgressTracker
 from .rate_limiter import AdaptiveRateLimiter
@@ -65,6 +67,7 @@ class DownloadOrchestrator:
         self.rate_limiter = AdaptiveRateLimiter(max_workers=config.workers)
         self.checkpoint_manager = CheckpointManager(config.output_path)
         self.page_tracker = PageTracker(config.output_path, self.checkpoint_manager)
+        self.failure_injector = FailureInjector()
         self.progress_tracker: ProgressTracker | None = None
 
         # Initialize storage backend
@@ -269,14 +272,18 @@ class DownloadOrchestrator:
                         page_seq=replay.page_seq,
                     )
                 )
+                self.failure_injector.hit("after_replay_enqueue")
             cursor = self.page_tracker.resume_cursor(cursor) or cursor
 
+        page_iter = self.api_client.list_works(
+            filter_str=self.config.filter_str,
+            content_format=self.config.content_format,
+            cursor=cursor,
+        )
+        closable_page_iter = page_iter if isinstance(page_iter, AsyncGenerator) else None
+
         try:
-            async for works, next_cursor in self.api_client.list_works(
-                filter_str=self.config.filter_str,
-                content_format=self.config.content_format,
-                cursor=cursor,
-            ):
+            async for works, next_cursor in page_iter:
                 if self._shutdown_requested:
                     break
 
@@ -305,6 +312,7 @@ class DownloadOrchestrator:
                         cursor_out=next_cursor,
                         work_ids=work_ids,
                     ).seq
+                    self.failure_injector.hit("after_page_register")
 
                 for work in queueable_works:
                     if self._shutdown_requested:
@@ -329,6 +337,10 @@ class DownloadOrchestrator:
         except Exception as e:
             if self.progress_tracker:
                 self.progress_tracker.log_error(f"Error listing works: {e}")
+            raise
+        finally:
+            if closable_page_iter is not None:
+                await closable_page_iter.aclose()
 
     async def _produce_work_from_sample(self) -> None:
         """Queue work items from a random sample (page-based pagination)."""
@@ -568,11 +580,13 @@ class DownloadOrchestrator:
                     credits=result.credits_cost,
                     error=result.error,
                 )
+                self.failure_injector.hit("after_result_record")
                 if self.progress_tracker and commit.committed_pages:
                     self.progress_tracker.update_pagination(
                         pages=commit.pages_completed,
                         cursor=commit.current_cursor,
                     )
+                    self.failure_injector.hit("after_page_commit")
             else:
                 if result.success:
                     self.checkpoint_manager.mark_completed(

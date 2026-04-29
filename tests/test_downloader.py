@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 
-from openalex_cli.api_client import WorkItem
+from openalex_cli.api_client import DownloadResult, WorkItem
 from openalex_cli.downloader import DownloadConfig, DownloadOrchestrator, QueuedWork
 from openalex_cli.progress import ProgressTracker
 from openalex_cli.utils import ContentFormat, StorageType
@@ -172,3 +172,236 @@ async def test_run_commits_terminal_manifest_during_startup_reconcile(tmp_path):
 
 async def _async_noop():
     return None
+
+
+async def _drain_metadata_only_run(orchestrator: DownloadOrchestrator) -> None:
+    """Run producer, one worker, and result processor to convergence."""
+    orchestrator._work_queue = asyncio.Queue()
+    orchestrator._results_queue = asyncio.Queue()
+
+    worker = asyncio.create_task(orchestrator._download_worker(0))
+    result_processor = asyncio.create_task(orchestrator._process_results())
+
+    await orchestrator._produce_work()
+    await orchestrator._work_queue.put(None)
+    await worker
+    await orchestrator._results_queue.put(
+        DownloadResult(work_id="__DONE__", format=ContentFormat.NONE, success=True)
+    )
+    await result_processor
+
+
+def _metadata_doc(work_id: str) -> dict[str, Any]:
+    return {
+        "id": f"https://openalex.org/{work_id}",
+        "has_content": {},
+        "title": work_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failpoint_triggers_after_page_register(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENALEX_FAILPOINTS", "after_page_register")
+
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator._work_queue = asyncio.Queue()
+
+    async def one_page(
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+        cursor: str = "*",
+    ):
+        del filter_str, content_format, cursor
+        yield [WorkItem(work_id="W1")], "cursor-1"
+
+    orchestrator.api_client.list_works = one_page  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="after_page_register"):
+        await orchestrator._produce_work()
+
+    manifests = orchestrator.page_tracker.state_store.list_manifests()
+    assert len(manifests) == 1
+    assert manifests[0].work_ids == ["W1"]
+
+
+@pytest.mark.asyncio
+async def test_failpoint_triggers_after_page_commit(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENALEX_FAILPOINTS", "after_page_commit")
+
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.progress_tracker = cast(ProgressTracker, _DummyProgress())
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    page = orchestrator.page_tracker.register_page("*", "cursor-1", ["W1"])
+    orchestrator._results_queue = asyncio.Queue()
+    await orchestrator._results_queue.put(
+        DownloadResult(
+            work_id="W1",
+            format=ContentFormat.NONE,
+            success=True,
+            file_size=10,
+            credits_cost=0,
+            page_seq=page.seq,
+        )
+    )
+    await orchestrator._results_queue.put(
+        DownloadResult(work_id="__DONE__", format=ContentFormat.NONE, success=True)
+    )
+
+    with pytest.raises(RuntimeError, match="after_page_commit"):
+        await orchestrator._process_results()
+
+    checkpoint = orchestrator.checkpoint_manager.get()
+    assert checkpoint.current_cursor == "cursor-1"
+    assert checkpoint.completed_work_ids == {"W1"}
+    assert orchestrator.page_tracker.state_store.list_manifests() == []
+
+
+@pytest.mark.asyncio
+async def test_restart_after_page_register_replays_from_disk_and_converges(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENALEX_FAILPOINTS", "after_page_register")
+
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        workers=1,
+    )
+
+    first = DownloadOrchestrator(config)
+    first.checkpoint_manager.create(filter_str=None, content_format="none")
+    first._work_queue = asyncio.Queue()
+
+    async def one_page_then_stop(
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+        cursor: str = "*",
+    ):
+        del filter_str, content_format
+        if cursor == "*":
+            yield [WorkItem(work_id="W1")], "cursor-1"
+
+    first.api_client.list_works = one_page_then_stop  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="after_page_register"):
+        await first._produce_work()
+
+    assert first.page_tracker.state_store.list_manifests()[0].work_ids == ["W1"]
+
+    monkeypatch.delenv("OPENALEX_FAILPOINTS")
+
+    second = DownloadOrchestrator(config)
+    second._setup_checkpoint()
+    fetches: list[str] = []
+    second.api_client.close = _async_noop  # type: ignore[method-assign]
+    second.storage.close = _async_noop  # type: ignore[method-assign]
+
+    async def no_new_pages(
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+        cursor: str = "*",
+    ):
+        del filter_str, content_format
+        assert cursor == "cursor-1"
+        if False:
+            yield [], None
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        fetches.append(work_id)
+        return _metadata_doc(work_id)
+
+    second.api_client.list_works = no_new_pages  # type: ignore[method-assign]
+    second.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+
+    await _drain_metadata_only_run(second)
+
+    checkpoint = second.checkpoint_manager.get()
+    assert fetches == ["W1"]
+    assert checkpoint.current_cursor == "cursor-1"
+    assert checkpoint.completed_work_ids == {"W1"}
+    assert second.page_tracker.state_store.list_manifests() == []
+    assert (tmp_path / "W1.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_after_result_record_replays_only_remaining_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENALEX_FAILPOINTS", "after_result_record")
+
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        workers=1,
+    )
+
+    first = DownloadOrchestrator(config)
+    first.checkpoint_manager.create(filter_str=None, content_format="none")
+    page = first.page_tracker.register_page("*", "cursor-1", ["W1", "W2"])
+    first._results_queue = asyncio.Queue()
+    await first._results_queue.put(
+        DownloadResult(
+            work_id="W1",
+            format=ContentFormat.NONE,
+            success=True,
+            file_size=10,
+            credits_cost=0,
+            page_seq=page.seq,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="after_result_record"):
+        await first._process_results()
+
+    manifest = first.page_tracker.state_store.list_manifests()[0]
+    assert manifest.work_states["W1"].state == "completed"
+    assert manifest.work_states["W2"].state == "pending"
+
+    monkeypatch.delenv("OPENALEX_FAILPOINTS")
+
+    second = DownloadOrchestrator(config)
+    second._setup_checkpoint()
+    fetches: list[str] = []
+    second.api_client.close = _async_noop  # type: ignore[method-assign]
+    second.storage.close = _async_noop  # type: ignore[method-assign]
+
+    async def no_new_pages(
+        filter_str: str | None = None,
+        content_format: ContentFormat = ContentFormat.NONE,
+        cursor: str = "*",
+    ):
+        del filter_str, content_format
+        assert cursor == "cursor-1"
+        if False:
+            yield [], None
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        fetches.append(work_id)
+        return _metadata_doc(work_id)
+
+    second.api_client.list_works = no_new_pages  # type: ignore[method-assign]
+    second.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+
+    await _drain_metadata_only_run(second)
+
+    checkpoint = second.checkpoint_manager.get()
+    assert fetches == ["W2"]
+    assert checkpoint.current_cursor == "cursor-1"
+    assert checkpoint.completed_work_ids == {"W1", "W2"}
+    assert second.page_tracker.state_store.list_manifests() == []
+    assert (tmp_path / "W2.json").exists()
