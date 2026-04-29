@@ -166,6 +166,17 @@ def main() -> None:
     type=click.IntRange(1, 200),
 )
 @click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Retry unresolved failed metadata downloads after the main run.",
+)
+@click.option(
+    "--retry-workers",
+    type=int,
+    default=None,
+    help="Worker count for the failed-ID retry phase.",
+)
+@click.option(
     "--resume/--no-resume",
     default=True,
     help="Resume from checkpoint if available",
@@ -210,6 +221,8 @@ def download(
     ids_str: str | None,
     use_stdin: bool,
     workers: int,
+    retry_failed: bool,
+    retry_workers: int | None,
     resume: bool,
     fresh: bool,
     sample_size: int | None,
@@ -250,6 +263,10 @@ def download(
         raise click.UsageError("--sample cannot be used with --ids or --stdin")
     if seed is not None and not sample_size:
         raise click.UsageError("--seed requires --sample")
+    if retry_workers is not None and not retry_failed:
+        raise click.UsageError("--retry-workers requires --retry-failed")
+    if retry_workers is not None and retry_workers <= 0:
+        raise click.UsageError("--retry-workers must be greater than 0")
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
@@ -282,6 +299,16 @@ def download(
             content_format = ContentFormat.PDF
         elif "xml" in types:
             content_format = ContentFormat.XML
+
+    if retry_failed:
+        if content_format != ContentFormat.NONE:
+            raise click.UsageError("--retry-failed currently supports metadata-only downloads only")
+        if sample_size:
+            raise click.UsageError("--retry-failed is not supported with --sample")
+        if ids_str:
+            raise click.UsageError("--retry-failed is not supported with --ids")
+        if use_stdin:
+            raise click.UsageError("--retry-failed is not supported with --stdin")
 
     # Warn if no filter and no IDs provided
     if not filter_str and not work_ids:
@@ -325,6 +352,8 @@ def download(
         original_identifiers=original_identifiers,
         sample=sample_size,
         seed=seed,
+        retry_failed=retry_failed,
+        retry_workers=retry_workers,
     )
 
     # Create progress tracker

@@ -409,3 +409,143 @@ async def test_restart_after_result_record_replays_only_remaining_work(tmp_path,
     assert checkpoint.completed_work_ids == {"W1", "W2"}
     assert second.page_tracker.state_store.list_manifests() == []
     assert (tmp_path / "W2.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_failed_retry_phase_skips_when_no_failed_ids(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+
+    called = False
+
+    async def fake_run_direct_work_id_phase(work_ids, workers):
+        nonlocal called
+        del work_ids, workers
+        called = True
+
+    orchestrator._run_direct_work_id_phase = fake_run_direct_work_id_phase  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_run_failed_retry_phase_uses_retry_workers(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+        retry_workers=10,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator.checkpoint_manager.mark_failed("W1")
+
+    seen = {}
+
+    async def fake_run_direct_work_id_phase(work_ids, workers):
+        seen["work_ids"] = work_ids
+        seen["workers"] = workers
+
+    orchestrator._run_direct_work_id_phase = fake_run_direct_work_id_phase  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    assert seen["work_ids"] == ["W1"]
+    assert seen["workers"] == 10
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_success_resolves_failed_work(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+        retry_workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator.checkpoint_manager.mark_failed("W1")
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        return _metadata_doc(work_id)
+
+    orchestrator.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+    orchestrator.api_client.close = _async_noop  # type: ignore[method-assign]
+    orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    checkpoint = orchestrator.checkpoint_manager.get()
+    assert "W1" not in checkpoint.failed_work_ids
+    assert "W1" in checkpoint.completed_work_ids
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_failure_leaves_id_failed(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+        retry_workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator.checkpoint_manager.mark_failed("W1")
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        del work_id
+        raise RuntimeError("still broken")
+
+    orchestrator.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+    orchestrator.api_client.close = _async_noop  # type: ignore[method-assign]
+    orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    checkpoint = orchestrator.checkpoint_manager.get()
+    assert "W1" in checkpoint.failed_work_ids
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_does_not_invoke_page_tracker(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+        retry_workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator.checkpoint_manager.mark_failed("W1")
+
+    def explode(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("page tracker should not be used in retry-failed mode")
+
+    orchestrator.page_tracker.register_page = explode  # type: ignore[method-assign]
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        return _metadata_doc(work_id)
+
+    orchestrator.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+    orchestrator.api_client.close = _async_noop  # type: ignore[method-assign]
+    orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()

@@ -41,6 +41,8 @@ class DownloadConfig:
     original_identifiers: dict[str, str] | None = None  # Maps work_id -> original input (e.g., DOI)
     sample: int | None = None  # Random sample size (max 10,000)
     seed: int | None = None  # Seed for reproducible random samples
+    retry_failed: bool = False
+    retry_workers: int | None = None
 
 
 @dataclass
@@ -88,6 +90,7 @@ class DownloadOrchestrator:
         # Control flags
         self._shutdown_requested = False
         self._credits_exhausted = False
+        self._retry_failed_phase = False
         self._page_tracking_enabled = (
             self.config.content_format == ContentFormat.NONE
             and not self.config.sample
@@ -172,6 +175,13 @@ class DownloadOrchestrator:
             )
             await result_processor
 
+            if (
+                self.config.retry_failed
+                and not self._shutdown_requested
+                and not self._credits_exhausted
+            ):
+                await self._run_failed_retry_phase()
+
         finally:
             # Clean up
             if self._page_tracking_enabled:
@@ -206,6 +216,10 @@ class DownloadOrchestrator:
                 "Purchase more at https://openalex.org/pricing. "
                 "Progress has been saved — use --resume to continue later."
             )
+
+    def _get_retry_workers(self) -> int:
+        """Return worker count for the failed-ID retry phase."""
+        return self.config.retry_workers or 10
 
     def _setup_checkpoint(self):
         """Set up or resume checkpoint."""
@@ -402,37 +416,81 @@ class DownloadOrchestrator:
         if not self.config.work_ids:
             return
 
-        # Fetch metadata for each work ID from the list API
-        # We need basic info like has_pdf/has_xml
         for work_id in self.config.work_ids:
             if self._shutdown_requested:
                 break
 
-            # Skip already completed
             if self.checkpoint_manager.is_completed(work_id):
                 continue
 
-            try:
-                # Fetch work metadata from singleton API
-                metadata = await self.api_client.get_work_metadata_with_retry(work_id)
-                work = WorkItem.from_api_response(metadata)
-                assert self._work_queue is not None
-                await self._work_queue.put(QueuedWork(work=work))
-            except CreditsExhaustedError:
-                self._handle_credits_exhausted()
-                break
-            except Exception as e:
-                if self.progress_tracker:
-                    self.progress_tracker.log_error(f"Error fetching metadata for {work_id}: {e}")
-                assert self._results_queue is not None
-                await self._results_queue.put(
-                    DownloadResult(
-                        work_id=work_id,
-                        format=ContentFormat.NONE,
-                        success=False,
-                        error=f"Failed to fetch metadata: {e}",
-                    )
-                )
+            assert self._work_queue is not None
+            await self._work_queue.put(QueuedWork(work=WorkItem(work_id=work_id)))
+
+    async def _run_direct_work_id_phase(self, work_ids: list[str], workers: int) -> None:
+        """Run a work-list phase using direct work IDs and existing worker/result logic."""
+        self._work_queue = asyncio.Queue()
+        self._results_queue = asyncio.Queue()
+
+        worker_tasks = [asyncio.create_task(self._download_worker(i)) for i in range(workers)]
+        result_processor = asyncio.create_task(self._process_results())
+
+        try:
+            for work_id in work_ids:
+                if self._shutdown_requested:
+                    break
+
+                if self.checkpoint_manager.is_completed(work_id):
+                    continue
+
+                await self._work_queue.put(QueuedWork(work=WorkItem(work_id=work_id)))
+
+            for _ in range(workers):
+                await self._work_queue.put(None)
+
+            await asyncio.gather(*worker_tasks)
+
+            await self._results_queue.put(
+                DownloadResult(work_id="__DONE__", format=ContentFormat.NONE, success=True)
+            )
+            await result_processor
+        finally:
+            for task in worker_tasks:
+                if not task.done():
+                    task.cancel()
+            if not result_processor.done():
+                result_processor.cancel()
+
+    async def _run_failed_retry_phase(self) -> None:
+        """Retry unresolved failed metadata downloads using a smaller worker pool."""
+        failed_ids = self.checkpoint_manager.get_failed_work_ids()
+        if not failed_ids:
+            if self.progress_tracker:
+                self.progress_tracker.log_info("No failed works to retry.")
+            return
+
+        retry_workers = self._get_retry_workers()
+
+        if self.progress_tracker:
+            self.progress_tracker.log_info(
+                f"Retrying {len(failed_ids)} failed works with {retry_workers} workers"
+            )
+
+        self._retry_failed_phase = True
+        try:
+            await self._run_direct_work_id_phase(
+                work_ids=failed_ids,
+                workers=retry_workers,
+            )
+        finally:
+            self._retry_failed_phase = False
+
+        remaining = len(self.checkpoint_manager.get_failed_work_ids())
+        recovered = len(failed_ids) - remaining
+
+        if self.progress_tracker:
+            self.progress_tracker.log_info(
+                f"Retry complete: recovered {recovered}, remaining failed {remaining}"
+            )
 
     async def _download_worker(self, worker_id: int) -> None:
         """Worker that downloads metadata and optionally content."""
@@ -599,14 +657,24 @@ class DownloadOrchestrator:
                     )
                     self.failure_injector.hit("after_page_commit")
             else:
-                if result.success:
-                    self.checkpoint_manager.mark_completed(
-                        result.work_id,
-                        result.file_size,
-                        result.credits_cost,
-                    )
+                if self._retry_failed_phase:
+                    if result.success:
+                        self.checkpoint_manager.resolve_failed_work(
+                            result.work_id,
+                            result.file_size,
+                            result.credits_cost,
+                        )
+                    else:
+                        self.checkpoint_manager.record_failed_retry(result.work_id)
                 else:
-                    self.checkpoint_manager.mark_failed(result.work_id)
+                    if result.success:
+                        self.checkpoint_manager.mark_completed(
+                            result.work_id,
+                            result.file_size,
+                            result.credits_cost,
+                        )
+                    else:
+                        self.checkpoint_manager.mark_failed(result.work_id)
 
             if self.progress_tracker:
                 self.progress_tracker.update_download(

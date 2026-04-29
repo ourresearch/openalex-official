@@ -173,6 +173,28 @@ class CheckpointManager:
         """Check if a work ID has already been completed."""
         return work_id in self.get().completed_work_ids
 
+    def get_failed_work_ids(self) -> list[str]:
+        """Return unresolved failed work IDs in stable order."""
+        return sorted(self.get().failed_work_ids)
+
+    def resolve_failed_work(self, work_id: str, file_size: int, credits: int) -> None:
+        """Move a failed work into the completed set after a successful retry."""
+        checkpoint = self.get()
+        checkpoint.failed_work_ids.discard(work_id)
+        checkpoint.completed_work_ids.add(work_id)
+        checkpoint.stats.total_downloaded += 1
+        checkpoint.stats.total_bytes += file_size
+        checkpoint.stats.credits_used += credits
+        checkpoint.stats.last_updated_at = time.time()
+        self._maybe_save()
+
+    def record_failed_retry(self, work_id: str) -> None:
+        """Keep a failed work unresolved after another failed retry attempt."""
+        checkpoint = self.get()
+        checkpoint.failed_work_ids.add(work_id)
+        checkpoint.stats.last_updated_at = time.time()
+        self._maybe_save()
+
     def terminal_work_ids(self) -> set[str]:
         """Return all work IDs with a committed terminal outcome."""
         checkpoint = self.get()
