@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .state_io import atomic_write_json
+
 
 @dataclass
 class DownloadStats:
@@ -109,7 +111,7 @@ class CheckpointManager:
                 data = json.load(f)
             self._checkpoint = Checkpoint.from_dict(data)
             return self._checkpoint
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError):
             # Corrupted checkpoint - return None to start fresh
             return None
 
@@ -171,6 +173,37 @@ class CheckpointManager:
         """Check if a work ID has already been completed."""
         return work_id in self.get().completed_work_ids
 
+    def terminal_work_ids(self) -> set[str]:
+        """Return all work IDs with a committed terminal outcome."""
+        checkpoint = self.get()
+        return checkpoint.completed_work_ids | checkpoint.failed_work_ids
+
+    def commit_page(
+        self,
+        cursor: str | None,
+        completed_entries: list[tuple[str, int, int]],
+        failed_work_ids: list[str],
+    ) -> None:
+        """Commit a fully terminal page and advance the durable cursor."""
+        checkpoint = self.get()
+
+        for work_id, file_size, credits in completed_entries:
+            checkpoint.completed_work_ids.add(work_id)
+            checkpoint.failed_work_ids.discard(work_id)
+            checkpoint.stats.total_downloaded += 1
+            checkpoint.stats.total_bytes += file_size
+            checkpoint.stats.credits_used += credits
+
+        for work_id in failed_work_ids:
+            checkpoint.failed_work_ids.add(work_id)
+            checkpoint.stats.total_failed += 1
+
+        checkpoint.current_cursor = cursor or "*"
+        checkpoint.pages_completed += 1
+        checkpoint.stats.last_updated_at = time.time()
+        self._save()
+        self._pending_saves = 0
+
     def _maybe_save(self) -> None:
         """Save checkpoint if threshold reached."""
         self._pending_saves += 1
@@ -182,8 +215,7 @@ class CheckpointManager:
         """Save checkpoint to disk."""
         checkpoint = self.get()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.checkpoint_path, "w") as f:
-            json.dump(checkpoint.to_dict(), f, indent=2)
+        atomic_write_json(self.checkpoint_path, checkpoint.to_dict())
 
     def force_save(self) -> None:
         """Force an immediate save (e.g., on shutdown)."""

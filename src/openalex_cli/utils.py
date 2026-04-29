@@ -125,13 +125,14 @@ def doi_to_filename(doi: str) -> str:
     return doi.replace("/", "_").replace(":", "_")
 
 
-def format_bytes(num_bytes: int) -> str:
+def format_bytes(num_bytes: float) -> str:
     """Format bytes as human-readable string."""
+    value = float(num_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if abs(num_bytes) < 1024:
-            return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} PB"
+        if abs(value) < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} PB"
 
 
 def format_rate(bytes_per_second: float) -> str:

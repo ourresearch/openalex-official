@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
 
-from aiobotocore.session import get_session
+from aiobotocore.session import get_session  # type: ignore[import-untyped]
 
 from .base import StorageBackend
-
-if TYPE_CHECKING:
-    from types_aiobotocore_s3 import S3Client
 
 
 class S3Storage(StorageBackend):

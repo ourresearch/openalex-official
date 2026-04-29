@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import Any, cast
 
 import aiohttp
 
@@ -61,6 +62,7 @@ class DownloadResult:
     credits_cost: int = 0
     rate_limit_remaining: int | None = None
     file_size: int = 0
+    page_seq: int | None = None
 
 
 @dataclass
@@ -157,10 +159,7 @@ class OpenAlexAPIClient:
                 content_filter = "has_content.pdf:true"
             else:
                 content_filter = "has_content.grobid_xml:true"
-            if filter_str:
-                full_filter = f"{content_filter},{filter_str}"
-            else:
-                full_filter = content_filter
+            full_filter = f"{content_filter},{filter_str}" if filter_str else content_filter
 
         while cursor:
             params = {
@@ -174,12 +173,8 @@ class OpenAlexAPIClient:
 
             async with session.get(url, params=params) as response:
                 if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 1)
-                    )
+                    remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                    credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 1))
                     if remaining < credits_required:
                         raise CreditsExhaustedError(
                             "Insufficient credits. Credits reset daily at midnight UTC."
@@ -235,12 +230,10 @@ class OpenAlexAPIClient:
                 content_filter = "has_content.pdf:true"
             else:
                 content_filter = "has_content.grobid_xml:true"
-            if filter_str:
-                full_filter = f"{content_filter},{filter_str}"
-            else:
-                full_filter = content_filter
+            full_filter = f"{content_filter},{filter_str}" if filter_str else content_filter
 
         import math
+
         total_pages = math.ceil(sample_size / self.per_page)
 
         for page in range(1, total_pages + 1):
@@ -259,12 +252,8 @@ class OpenAlexAPIClient:
 
             async with session.get(url, params=params) as response:
                 if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 1)
-                    )
+                    remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                    credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 1))
                     if remaining < credits_required:
                         raise CreditsExhaustedError(
                             "Insufficient credits. Credits reset daily at midnight UTC."
@@ -319,12 +308,8 @@ class OpenAlexAPIClient:
                     )
 
                 if response.status == 429:
-                    remaining = int(
-                        response.headers.get("X-RateLimit-Remaining", 0)
-                    )
-                    credits_required = int(
-                        response.headers.get("X-RateLimit-Credits-Required", 0)
-                    )
+                    remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                    credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 0))
                     is_exhausted = remaining < credits_required
                     return DownloadResult(
                         work_id=work_id,
@@ -385,7 +370,7 @@ class OpenAlexAPIClient:
                 error="Request timed out",
             )
 
-    async def get_work_metadata(self, work_id: str) -> dict:
+    async def get_work_metadata(self, work_id: str) -> dict[str, Any]:
         """
         Fetch full work metadata from singleton API.
 
@@ -409,12 +394,8 @@ class OpenAlexAPIClient:
             if response.status == 404:
                 raise Exception(f"Work not found: {work_id}")
             if response.status == 429:
-                remaining = int(
-                    response.headers.get("X-RateLimit-Remaining", 0)
-                )
-                credits_required = int(
-                    response.headers.get("X-RateLimit-Credits-Required", 1)
-                )
+                remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                credits_required = int(response.headers.get("X-RateLimit-Credits-Required", 1))
                 if remaining < credits_required:
                     raise CreditsExhaustedError(
                         "Insufficient credits. Credits reset daily at midnight UTC."
@@ -426,7 +407,7 @@ class OpenAlexAPIClient:
                     message="Rate limited",
                 )
             response.raise_for_status()
-            return await response.json()
+            return cast(dict[str, Any], await response.json())
 
     async def resolve_dois(self, dois: list[str]) -> dict[str, str]:
         """

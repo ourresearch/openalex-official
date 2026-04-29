@@ -1,5 +1,7 @@
 """Tests for utility functions."""
 
+from pathlib import Path
+
 import pytest
 
 from openalex_cli.utils import (
@@ -25,15 +27,15 @@ class TestWorkIdToPath:
 
     def test_nested_standard_work_id(self):
         path = work_id_to_path("W2741809807", "pdf", nested=True)
-        assert str(path) == "W27/41/W2741809807.pdf"
+        assert Path(path).parts == ("W27", "41", "W2741809807.pdf")
 
     def test_nested_short_work_id(self):
         path = work_id_to_path("W123", "pdf", nested=True)
-        assert str(path) == "W01/23/W123.pdf"
+        assert Path(path).parts == ("W01", "23", "W123.pdf")
 
     def test_nested_xml_extension(self):
         path = work_id_to_path("W2741809807", "tei.xml", nested=True)
-        assert str(path) == "W27/41/W2741809807.tei.xml"
+        assert Path(path).parts == ("W27", "41", "W2741809807.tei.xml")
 
 
 class TestParseWorkId:
@@ -94,10 +96,7 @@ class TestDoiToFilename:
         assert doi_to_filename("10.1038/nature12373") == "10.1038_nature12373"
 
     def test_doi_with_multiple_slashes(self):
-        assert (
-            doi_to_filename("10.1000/journal.pone.0000000")
-            == "10.1000_journal.pone.0000000"
-        )
+        assert doi_to_filename("10.1000/journal.pone.0000000") == "10.1000_journal.pone.0000000"
 
     def test_doi_with_colon(self):
         assert doi_to_filename("10.1234:example") == "10.1234_example"
