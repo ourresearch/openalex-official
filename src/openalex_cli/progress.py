@@ -40,6 +40,8 @@ class ProgressStats:
     current_cursor: str | None = None
     expected_total_works: int | None = None
     starting_completed: int = 0
+    authoritative_completed: int = 0
+    authoritative_unresolved_failed: int = 0
 
 
 class ProgressTracker:
@@ -175,10 +177,22 @@ class ProgressTracker:
         """Initialize total progress tracking for a new or resumed run."""
         self.stats.starting_completed = starting_completed
         self.stats.expected_total_works = expected_total_works
+        self.stats.authoritative_completed = starting_completed
 
         if self._progress and self._task_id is not None and expected_total_works is not None:
             self._progress.update(self._task_id, total=expected_total_works)
 
+        self._refresh_display()
+
+    def sync_checkpoint_state(
+        self,
+        completed_count: int,
+        unresolved_failed_count: int | None = None,
+    ) -> None:
+        """Sync progress display with durable checkpoint state."""
+        self.stats.authoritative_completed = completed_count
+        if unresolved_failed_count is not None:
+            self.stats.authoritative_unresolved_failed = unresolved_failed_count
         self._refresh_display()
 
     def log_info(self, message: str) -> None:
@@ -205,9 +219,7 @@ class ProgressTracker:
             stats = self._format_stats()
             update_kwargs: dict[str, Any] = {"stats": stats}
             if self.stats.expected_total_works is not None:
-                update_kwargs["completed"] = (
-                    self.stats.starting_completed + self.stats.total_downloaded
-                )
+                update_kwargs["completed"] = self.stats.authoritative_completed
             self._progress.update(self._task_id, **update_kwargs)
             self._live.update(self._make_display())
 
@@ -239,9 +251,13 @@ class ProgressTracker:
             "Pages:",
             f"{self.stats.pages_completed} completed",
         )
+        table.add_row(
+            "Unresolved failed:",
+            f"{format_count(self.stats.authoritative_unresolved_failed)} works",
+        )
 
         if self.stats.expected_total_works is not None:
-            completed = self.stats.starting_completed + self.stats.total_downloaded
+            completed = self.stats.authoritative_completed
             remaining = max(self.stats.expected_total_works - completed, 0)
             percent = (
                 completed / self.stats.expected_total_works
@@ -302,7 +318,7 @@ class ProgressTracker:
         elapsed = time.time() - self.stats.start_time
         files_per_sec = self.stats.total_downloaded / elapsed if elapsed > 0 else 0
         if self.stats.expected_total_works is not None:
-            completed = self.stats.starting_completed + self.stats.total_downloaded
+            completed = self.stats.authoritative_completed
             return (
                 f"{format_count(completed)} / {format_count(self.stats.expected_total_works)} • "
                 f"{format_count(self.stats.total_failed)} failed • "

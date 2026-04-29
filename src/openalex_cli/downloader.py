@@ -131,6 +131,7 @@ class DownloadOrchestrator:
                     starting_completed=len(checkpoint.completed_work_ids),
                     expected_total_works=checkpoint.expected_total_works,
                 )
+                self._sync_progress_checkpoint_state()
 
             if self._page_tracking_enabled:
                 commit = self.page_tracker.startup_reconcile()
@@ -236,6 +237,17 @@ class DownloadOrchestrator:
             and not self.config.work_ids
         )
 
+    def _sync_progress_checkpoint_state(self) -> None:
+        """Sync progress display from durable checkpoint state."""
+        if not self.progress_tracker:
+            return
+
+        checkpoint = self.checkpoint_manager.get()
+        self.progress_tracker.sync_checkpoint_state(
+            completed_count=len(checkpoint.completed_work_ids),
+            unresolved_failed_count=len(checkpoint.failed_work_ids),
+        )
+
     async def _setup_checkpoint(self):
         """Set up or resume checkpoint."""
         # Check for existing checkpoint
@@ -286,14 +298,15 @@ class DownloadOrchestrator:
                                 )
 
                     if self.progress_tracker:
-                        stats = existing.stats
+                        completed = len(existing.completed_work_ids)
+                        unresolved_failed = len(existing.failed_work_ids)
                         expected_total = existing.expected_total_works
                         total_suffix = (
                             f" of {expected_total:,} expected" if expected_total is not None else ""
                         )
                         self.progress_tracker.log_info(
-                            f"Resuming from checkpoint: {stats.total_downloaded} downloaded, "
-                            f"{stats.total_failed} failed{total_suffix}"
+                            f"Resuming from checkpoint: {completed} completed, "
+                            f"{unresolved_failed} unresolved failed{total_suffix}"
                         )
                     return existing
 
@@ -528,10 +541,12 @@ class DownloadOrchestrator:
             return
 
         retry_workers = self._get_retry_workers()
+        original_rate_limiter = self.rate_limiter
+        self.rate_limiter = AdaptiveRateLimiter(max_workers=retry_workers)
 
         if self.progress_tracker:
             self.progress_tracker.log_info(
-                f"Retrying {len(failed_ids)} failed works with {retry_workers} workers"
+                f"Retrying {len(failed_ids)} unresolved failed works with {retry_workers} workers"
             )
 
         self._retry_failed_phase = True
@@ -542,13 +557,14 @@ class DownloadOrchestrator:
             )
         finally:
             self._retry_failed_phase = False
+            self.rate_limiter = original_rate_limiter
 
         remaining = len(self.checkpoint_manager.get_failed_work_ids())
         recovered = len(failed_ids) - remaining
 
         if self.progress_tracker:
             self.progress_tracker.log_info(
-                f"Retry complete: recovered {recovered}, remaining failed {remaining}"
+                f"Retry phase complete: recovered {recovered}, remaining unresolved {remaining}"
             )
 
     async def _download_worker(self, worker_id: int) -> None:
@@ -715,6 +731,7 @@ class DownloadOrchestrator:
                         cursor=commit.current_cursor,
                     )
                     self.failure_injector.hit("after_page_commit")
+                self._sync_progress_checkpoint_state()
             else:
                 if self._retry_failed_phase:
                     if result.success:
@@ -734,6 +751,7 @@ class DownloadOrchestrator:
                         )
                     else:
                         self.checkpoint_manager.mark_failed(result.work_id)
+                self._sync_progress_checkpoint_state()
 
             if self.progress_tracker:
                 self.progress_tracker.update_download(

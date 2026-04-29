@@ -22,6 +22,13 @@ class _DummyProgress:
     ) -> None:
         self.last_totals = (starting_completed, expected_total_works)
 
+    def sync_checkpoint_state(
+        self,
+        completed_count: int,
+        unresolved_failed_count: int | None = None,
+    ) -> None:
+        self.last_sync = (completed_count, unresolved_failed_count)
+
     def update_pagination(self, pages: int, cursor: str | None) -> None:
         self.last_pagination = (pages, cursor)
 
@@ -459,10 +466,12 @@ async def test_run_failed_retry_phase_uses_retry_workers(tmp_path):
     orchestrator.checkpoint_manager.mark_failed("W1")
 
     seen = {}
+    original_rate_limiter = orchestrator.rate_limiter
 
     async def fake_run_direct_work_id_phase(work_ids, workers):
         seen["work_ids"] = work_ids
         seen["workers"] = workers
+        seen["limiter_max"] = orchestrator.rate_limiter.max_workers
 
     orchestrator._run_direct_work_id_phase = fake_run_direct_work_id_phase  # type: ignore[method-assign]
 
@@ -470,6 +479,37 @@ async def test_run_failed_retry_phase_uses_retry_workers(tmp_path):
 
     assert seen["work_ids"] == ["W1"]
     assert seen["workers"] == 10
+    assert seen["limiter_max"] == 10
+    assert orchestrator.rate_limiter is original_rate_limiter
+
+
+@pytest.mark.asyncio
+async def test_run_failed_retry_phase_skips_when_only_historical_failures_exist(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    checkpoint = orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    checkpoint.stats.total_failed = 558
+    checkpoint.failed_work_ids.clear()
+    orchestrator.checkpoint_manager.force_save()
+
+    called = False
+
+    async def fake_run_direct_work_id_phase(work_ids, workers):
+        nonlocal called
+        del work_ids, workers
+        called = True
+
+    orchestrator._run_direct_work_id_phase = fake_run_direct_work_id_phase  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    assert called is False
 
 
 @pytest.mark.asyncio
@@ -679,6 +719,40 @@ async def test_setup_checkpoint_backfills_missing_total_on_resume(tmp_path):
     assert calls == ["publication_year:2024"]
 
 
+@pytest.mark.asyncio
+async def test_setup_checkpoint_resume_log_uses_unresolved_failed_count(tmp_path):
+    orchestrator = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    progress = cast(ProgressTracker, _DummyProgress())
+    orchestrator.progress_tracker = progress
+
+    checkpoint = orchestrator.checkpoint_manager.create(
+        filter_str="publication_year:2024",
+        content_format="none",
+        expected_total_works=456,
+    )
+    checkpoint.completed_work_ids = {"W1", "W2"}
+    checkpoint.failed_work_ids.clear()
+    checkpoint.stats.total_failed = 558
+    orchestrator.checkpoint_manager.force_save()
+
+    loaded = await orchestrator._setup_checkpoint()
+
+    assert loaded is not None
+    assert (
+        progress.last_info
+        == "Resuming from checkpoint: 2 completed, 0 unresolved failed of 456 expected"
+    )
+
+
 def test_progress_tracker_initializes_known_total(tmp_path):
     tracker = ProgressTracker(output_dir=tmp_path, quiet=True, verbose=False)
 
@@ -687,4 +761,15 @@ def test_progress_tracker_initializes_known_total(tmp_path):
 
     assert tracker.stats.starting_completed == 100
     assert tracker.stats.expected_total_works == 250
-    assert "101 / 250" in tracker._format_stats()
+    assert "100 / 250" in tracker._format_stats()
+
+
+def test_progress_tracker_sync_uses_checkpoint_completed_count(tmp_path):
+    tracker = ProgressTracker(output_dir=tmp_path, quiet=True, verbose=False)
+
+    tracker.initialize_totals(starting_completed=100, expected_total_works=250)
+    tracker.sync_checkpoint_state(completed_count=150, unresolved_failed_count=3)
+
+    assert tracker.stats.authoritative_completed == 150
+    assert tracker.stats.authoritative_unresolved_failed == 3
+    assert "150 / 250" in tracker._format_stats()
