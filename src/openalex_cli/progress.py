@@ -42,6 +42,9 @@ class ProgressStats:
     starting_completed: int = 0
     authoritative_completed: int = 0
     authoritative_unresolved_failed: int = 0
+    retry_attempted: int = 0
+    retry_recovered: int = 0
+    retry_remaining: int = 0
 
 
 class ProgressTracker:
@@ -193,6 +196,13 @@ class ProgressTracker:
         self.stats.authoritative_completed = completed_count
         if unresolved_failed_count is not None:
             self.stats.authoritative_unresolved_failed = unresolved_failed_count
+        self._refresh_display()
+
+    def record_retry_summary(self, attempted: int, recovered: int, remaining: int) -> None:
+        """Record the outcome of the failed-work retry phase."""
+        self.stats.retry_attempted = attempted
+        self.stats.retry_recovered = recovered
+        self.stats.retry_remaining = remaining
         self._refresh_display()
 
     def log_info(self, message: str) -> None:
@@ -355,6 +365,13 @@ class ProgressTracker:
             f"  Duration: {elapsed:.1f}s\n"
             f"  Average speed: {format_rate(rate)}"
         )
+
+        if self.stats.retry_attempted:
+            summary += (
+                f"\n  Retry recovery: {format_count(self.stats.retry_recovered)} / "
+                f"{format_count(self.stats.retry_attempted)} succeeded"
+                f" ({format_count(self.stats.retry_remaining)} unresolved remaining)"
+            )
 
         self._logger.info(summary)
         if self.is_tty:

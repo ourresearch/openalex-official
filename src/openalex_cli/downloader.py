@@ -133,6 +133,13 @@ class DownloadOrchestrator:
                 )
                 self._sync_progress_checkpoint_state()
 
+            if self._should_exit_without_work(checkpoint):
+                if self.progress_tracker:
+                    self.progress_tracker.log_info(
+                        "Nothing left to download; checkpoint already covers all expected works."
+                    )
+                return
+
             if self._page_tracking_enabled:
                 commit = self.page_tracker.startup_reconcile()
                 if self.progress_tracker and commit.committed_pages:
@@ -246,6 +253,24 @@ class DownloadOrchestrator:
         self.progress_tracker.sync_checkpoint_state(
             completed_count=len(checkpoint.completed_work_ids),
             unresolved_failed_count=len(checkpoint.failed_work_ids),
+        )
+
+    def _should_exit_without_work(self, checkpoint) -> bool:
+        """Return True when resume state proves this run has no work left to do."""
+        if checkpoint.failed_work_ids and self.config.retry_failed:
+            return False
+
+        if self.config.work_ids:
+            return all(
+                self.checkpoint_manager.is_completed(work_id) for work_id in self.config.work_ids
+            )
+
+        expected_total = checkpoint.expected_total_works
+        if expected_total is None:
+            return False
+
+        return (
+            len(checkpoint.completed_work_ids) >= expected_total and not checkpoint.failed_work_ids
         )
 
     async def _setup_checkpoint(self):
@@ -563,6 +588,11 @@ class DownloadOrchestrator:
         recovered = len(failed_ids) - remaining
 
         if self.progress_tracker:
+            self.progress_tracker.record_retry_summary(
+                attempted=len(failed_ids),
+                recovered=recovered,
+                remaining=remaining,
+            )
             self.progress_tracker.log_info(
                 f"Retry phase complete: recovered {recovered}, remaining unresolved {remaining}"
             )

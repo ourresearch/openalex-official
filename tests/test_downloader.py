@@ -12,6 +12,9 @@ from openalex_cli.utils import ContentFormat, StorageType
 
 
 class _DummyProgress:
+    def __init__(self) -> None:
+        self.info_messages: list[str] = []
+
     def log_warning(self, message: str) -> None:
         self.last_warning = message
 
@@ -37,9 +40,13 @@ class _DummyProgress:
 
     def log_info(self, message: str) -> None:
         self.last_info = message
+        self.info_messages.append(message)
 
     def log_error(self, message: str) -> None:
         self.last_error = message
+
+    def record_retry_summary(self, attempted: int, recovered: int, remaining: int) -> None:
+        self.retry_summary = (attempted, recovered, remaining)
 
 
 @pytest.mark.asyncio
@@ -541,6 +548,34 @@ async def test_retry_failed_success_resolves_failed_work(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_retry_failed_records_retry_summary(tmp_path):
+    config = DownloadConfig(
+        api_key="test-key",
+        output_path=str(tmp_path),
+        storage_type=StorageType.LOCAL,
+        content_format=ContentFormat.NONE,
+        retry_failed=True,
+        retry_workers=1,
+    )
+    orchestrator = DownloadOrchestrator(config)
+    dummy = _DummyProgress()
+    orchestrator.progress_tracker = cast(ProgressTracker, dummy)
+    orchestrator.checkpoint_manager.create(filter_str=None, content_format="none")
+    orchestrator.checkpoint_manager.mark_failed("W1")
+
+    async def fetch_metadata(work_id: str) -> dict[str, Any]:
+        return _metadata_doc(work_id)
+
+    orchestrator.api_client.get_work_metadata = fetch_metadata  # type: ignore[method-assign]
+    orchestrator.api_client.close = _async_noop  # type: ignore[method-assign]
+    orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
+
+    await orchestrator._run_failed_retry_phase()
+
+    assert dummy.retry_summary == (1, 1, 0)
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_failure_leaves_id_failed(tmp_path):
     config = DownloadConfig(
         api_key="test-key",
@@ -731,8 +766,8 @@ async def test_setup_checkpoint_resume_log_uses_unresolved_failed_count(tmp_path
             workers=1,
         )
     )
-    progress = cast(ProgressTracker, _DummyProgress())
-    orchestrator.progress_tracker = progress
+    dummy = _DummyProgress()
+    orchestrator.progress_tracker = cast(ProgressTracker, dummy)
 
     checkpoint = orchestrator.checkpoint_manager.create(
         filter_str="publication_year:2024",
@@ -748,9 +783,69 @@ async def test_setup_checkpoint_resume_log_uses_unresolved_failed_count(tmp_path
 
     assert loaded is not None
     assert (
-        progress.last_info
+        dummy.last_info
         == "Resuming from checkpoint: 2 completed, 0 unresolved failed of 456 expected"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_exits_early_when_checkpoint_is_already_complete(tmp_path):
+    existing = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    checkpoint = existing.checkpoint_manager.create(
+        filter_str="publication_year:2024",
+        content_format="none",
+        expected_total_works=2,
+    )
+    checkpoint.completed_work_ids = {"W1", "W2"}
+    existing.checkpoint_manager.force_save()
+
+    orchestrator = DownloadOrchestrator(
+        DownloadConfig(
+            api_key="test-key",
+            output_path=str(tmp_path),
+            storage_type=StorageType.LOCAL,
+            content_format=ContentFormat.NONE,
+            filter_str="publication_year:2024",
+            workers=1,
+        )
+    )
+    dummy = _DummyProgress()
+    orchestrator.api_client.close = _async_noop  # type: ignore[method-assign]
+    orchestrator.storage.close = _async_noop  # type: ignore[method-assign]
+
+    async def fail_list_works(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("list_works should not run when checkpoint is already complete")
+        yield
+
+    orchestrator.api_client.list_works = fail_list_works  # type: ignore[method-assign]
+
+    await orchestrator.run(progress_tracker=cast(ProgressTracker, dummy))
+
+    assert dummy.last_totals == (2, 2)
+    assert dummy.last_sync == (2, 0)
+    assert (
+        dummy.last_info == "Nothing left to download; checkpoint already covers all expected works."
+    )
+
+
+def test_progress_tracker_summary_includes_retry_recovery(tmp_path, caplog):
+    tracker = ProgressTracker(output_dir=tmp_path, quiet=True, verbose=False)
+    tracker.record_retry_summary(attempted=571, recovered=571, remaining=0)
+
+    with caplog.at_level("INFO", logger="openalex-content"):
+        tracker.stop()
+
+    assert "Retry recovery: 571 / 571 succeeded (0 unresolved remaining)" in caplog.text
 
 
 def test_progress_tracker_initializes_known_total(tmp_path):
