@@ -81,8 +81,7 @@ async def _resolve_identifiers(
                     original_map[work_id] = doi  # Remember original DOI for filename
                 elif not quiet:
                     click.echo(
-                        click.style("Warning: ", fg="yellow")
-                        + f"DOI not found in OpenAlex: {doi}"
+                        click.style("Warning: ", fg="yellow") + f"DOI not found in OpenAlex: {doi}"
                     )
         finally:
             await client.close()
@@ -167,6 +166,17 @@ def main() -> None:
     type=click.IntRange(1, 200),
 )
 @click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Retry unresolved failed metadata downloads after the main run.",
+)
+@click.option(
+    "--retry-workers",
+    type=int,
+    default=None,
+    help="Worker count for the failed-ID retry phase.",
+)
+@click.option(
     "--resume/--no-resume",
     default=True,
     help="Resume from checkpoint if available",
@@ -211,6 +221,8 @@ def download(
     ids_str: str | None,
     use_stdin: bool,
     workers: int,
+    retry_failed: bool,
+    retry_workers: int | None,
     resume: bool,
     fresh: bool,
     sample_size: int | None,
@@ -251,6 +263,10 @@ def download(
         raise click.UsageError("--sample cannot be used with --ids or --stdin")
     if seed is not None and not sample_size:
         raise click.UsageError("--seed requires --sample")
+    if retry_workers is not None and not retry_failed:
+        raise click.UsageError("--retry-workers requires --retry-failed")
+    if retry_workers is not None and retry_workers <= 0:
+        raise click.UsageError("--retry-workers must be greater than 0")
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
@@ -260,20 +276,15 @@ def download(
         raw_ids = _parse_input_ids(ids_str, use_stdin)
         if not raw_ids:
             click.echo(
-                click.style("Error: ", fg="red")
-                + "No work IDs provided. Check your input.",
+                click.style("Error: ", fg="red") + "No work IDs provided. Check your input.",
                 err=True,
             )
             if use_stdin:
                 click.echo("  stdin was empty — verify your pipe or input file.", err=True)
             sys.exit(1)
-        work_ids, original_identifiers = asyncio.run(
-            _resolve_identifiers(raw_ids, api_key, quiet)
-        )
+        work_ids, original_identifiers = asyncio.run(_resolve_identifiers(raw_ids, api_key, quiet))
         if not work_ids:
-            click.echo(
-                click.style("Error: ", fg="red") + "No valid work IDs found.", err=True
-            )
+            click.echo(click.style("Error: ", fg="red") + "No valid work IDs found.", err=True)
             sys.exit(1)
         if not quiet:
             click.echo(f"Found {len(work_ids)} work(s) to download.")
@@ -282,14 +293,22 @@ def download(
     content_format = ContentFormat.NONE
     if content_types:
         types = [t.strip().lower() for t in content_types.split(",")]
-        if "pdf" in types and "xml" in types:
-            content_format = ContentFormat.BOTH
-        elif "both" in types:
+        if ("pdf" in types and "xml" in types) or "both" in types:
             content_format = ContentFormat.BOTH
         elif "pdf" in types:
             content_format = ContentFormat.PDF
         elif "xml" in types:
             content_format = ContentFormat.XML
+
+    if retry_failed:
+        if content_format != ContentFormat.NONE:
+            raise click.UsageError("--retry-failed currently supports metadata-only downloads only")
+        if sample_size:
+            raise click.UsageError("--retry-failed is not supported with --sample")
+        if ids_str:
+            raise click.UsageError("--retry-failed is not supported with --ids")
+        if use_stdin:
+            raise click.UsageError("--retry-failed is not supported with --stdin")
 
     # Warn if no filter and no IDs provided
     if not filter_str and not work_ids:
@@ -333,6 +352,8 @@ def download(
         original_identifiers=original_identifiers,
         sample=sample_size,
         seed=seed,
+        retry_failed=retry_failed,
+        retry_workers=retry_workers,
     )
 
     # Create progress tracker
@@ -372,7 +393,7 @@ def status(api_key: str) -> None:
         client = OpenAlexAPIClient(api_key=api_key)
         try:
             status = await client.get_status()
-            click.echo(f"API Key Status:")
+            click.echo("API Key Status:")
             click.echo(f"  Rate limit remaining: {status.rate_limit_remaining:,}")
             click.echo()
             click.echo("Note: Full credit information requires a premium API key.")

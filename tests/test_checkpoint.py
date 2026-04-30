@@ -1,12 +1,8 @@
 """Tests for checkpoint system."""
 
-import json
 import tempfile
-from pathlib import Path
 
-import pytest
-
-from openalex_cli.checkpoint import Checkpoint, CheckpointManager, DownloadStats
+from openalex_cli.checkpoint import Checkpoint, CheckpointManager
 
 
 class TestCheckpoint:
@@ -14,6 +10,7 @@ class TestCheckpoint:
         checkpoint = Checkpoint(
             filter_str="publication_year:2024",
             content_format="pdf",
+            expected_total_works=12345,
             current_cursor="abc123",
             pages_completed=5,
             completed_work_ids={"W1", "W2", "W3"},
@@ -27,6 +24,7 @@ class TestCheckpoint:
 
         assert restored.filter_str == "publication_year:2024"
         assert restored.content_format == "pdf"
+        assert restored.expected_total_works == 12345
         assert restored.current_cursor == "abc123"
         assert restored.pages_completed == 5
         assert restored.completed_work_ids == {"W1", "W2", "W3"}
@@ -44,9 +42,11 @@ class TestCheckpointManager:
             checkpoint = manager.create(
                 filter_str="type:article",
                 content_format="xml",
+                expected_total_works=999,
             )
             assert checkpoint.filter_str == "type:article"
             assert checkpoint.content_format == "xml"
+            assert checkpoint.expected_total_works == 999
 
             # Load should return same data
             manager2 = CheckpointManager(tmpdir)
@@ -54,6 +54,7 @@ class TestCheckpointManager:
             assert loaded is not None
             assert loaded.filter_str == "type:article"
             assert loaded.content_format == "xml"
+            assert loaded.expected_total_works == 999
 
     def test_mark_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,6 +77,40 @@ class TestCheckpointManager:
 
             assert "W123" in manager.get().failed_work_ids
             assert manager.get().stats.total_failed == 1
+
+    def test_get_failed_work_ids_sorted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            manager.create()
+            manager.mark_failed("W2")
+            manager.mark_failed("W1")
+
+            assert manager.get_failed_work_ids() == ["W1", "W2"]
+
+    def test_resolve_failed_work_moves_id_to_completed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            manager.create()
+            manager.mark_failed("W1")
+
+            manager.resolve_failed_work("W1", 100, 0)
+
+            checkpoint = manager.get()
+            assert "W1" not in checkpoint.failed_work_ids
+            assert "W1" in checkpoint.completed_work_ids
+            assert checkpoint.stats.total_downloaded == 1
+            assert checkpoint.stats.total_bytes == 100
+
+    def test_record_failed_retry_keeps_id_failed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            manager.create()
+            manager.mark_failed("W1")
+
+            manager.record_failed_retry("W1")
+
+            checkpoint = manager.get()
+            assert "W1" in checkpoint.failed_work_ids
 
     def test_update_cursor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -110,4 +145,25 @@ class TestCheckpointManager:
             # Verify saved to disk
             manager2 = CheckpointManager(tmpdir)
             loaded = manager2.load()
+            assert loaded is not None
             assert len(loaded.completed_work_ids) == 100
+
+    def test_commit_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            manager.create(filter_str="type:article", content_format="none")
+
+            manager.commit_page(
+                cursor="cursor_abc",
+                completed_entries=[("W1", 100, 0), ("W2", 200, 0)],
+                failed_work_ids=["W3"],
+            )
+
+            checkpoint = manager.get()
+            assert checkpoint.current_cursor == "cursor_abc"
+            assert checkpoint.pages_completed == 1
+            assert checkpoint.completed_work_ids == {"W1", "W2"}
+            assert checkpoint.failed_work_ids == {"W3"}
+            assert checkpoint.stats.total_downloaded == 2
+            assert checkpoint.stats.total_failed == 1
+            assert checkpoint.stats.total_bytes == 300
