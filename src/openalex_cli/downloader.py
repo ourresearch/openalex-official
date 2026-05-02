@@ -791,3 +791,153 @@ class DownloadOrchestrator:
                     error=result.error,
                     rate_limiter_state=self.rate_limiter.get_state(),
                 )
+
+
+class MultiFilterOrchestrator:
+    """Orchestrates multiple filter downloads into a single output directory."""
+
+    def __init__(
+        self,
+        api_key: str,
+        output_path: str,
+        filters: list[dict],
+        content_format: ContentFormat = ContentFormat.NONE,
+        workers: int = 50,
+        resume: bool = True,
+        fresh: bool = False,
+        quiet: bool = False,
+        verbose: bool = False,
+        nested: bool = False,
+        retry_failed: bool = False,
+        retry_workers: int | None = None,
+        resume_filter: str | None = None,
+    ):
+        self.api_key = api_key
+        self.output_path = output_path
+        self.filters = filters
+        self.content_format = content_format
+        self.workers = workers
+        self.resume = resume
+        self.fresh = fresh
+        self.quiet = quiet
+        self.verbose = verbose
+        self.nested = nested
+        self.retry_failed = retry_failed
+        self.retry_workers = retry_workers
+        self.resume_filter = resume_filter
+
+    async def run(self, progress_tracker: ProgressTracker | None = None) -> None:
+        """Run downloads for all filters."""
+        from .checkpoint import CheckpointManager
+
+        checkpoint_manager = CheckpointManager(self.output_path)
+
+        # Load or create checkpoint
+        if checkpoint_manager.exists() and not self.fresh:
+            checkpoint = checkpoint_manager.load()
+        else:
+            checkpoint = None
+
+        if checkpoint is None:
+            # Create new multi-filter checkpoint
+            from .checkpoint import Checkpoint
+
+            checkpoint = Checkpoint(mode="multi")
+            checkpoint_manager._checkpoint = checkpoint
+            checkpoint_manager.force_save()
+
+        # If resume_filter specified, only run that filter
+        filters_to_run = self.filters
+        if self.resume_filter:
+            filters_to_run = [f for f in self.filters if f.get("name") == self.resume_filter]
+            if not filters_to_run:
+                if progress_tracker:
+                    progress_tracker.log_error(
+                        f"Filter '{self.resume_filter}' not found in configuration"
+                    )
+                return
+
+        # Run each filter
+        for filter_config in filters_to_run:
+            filter_name = filter_config.get("name", "unnamed")
+            filter_str = filter_config.get("filter", "")
+
+            if progress_tracker:
+                progress_tracker.log_info(f"Starting filter: {filter_name}")
+
+            # Check if this filter is already complete
+            existing_filter = None
+            for f in checkpoint.filters:
+                if f.filter_str == filter_str:
+                    existing_filter = f
+                    break
+
+            if existing_filter and existing_filter.status == "complete":
+                if progress_tracker:
+                    progress_tracker.log_info(f"Filter '{filter_name}' already complete, skipping")
+                continue
+
+            # Create config for this filter
+            config = DownloadConfig(
+                api_key=self.api_key,
+                output_path=self.output_path,
+                filter_str=filter_str,
+                content_format=self.content_format,
+                workers=self.workers,
+                resume=self.resume,
+                fresh=self.fresh,
+                quiet=self.quiet,
+                verbose=self.verbose,
+                nested=self.nested,
+                retry_failed=self.retry_failed,
+                retry_workers=self.retry_workers,
+            )
+
+            # Create orchestrator and run
+            orchestrator = DownloadOrchestrator(config)
+
+            try:
+                if progress_tracker:
+                    progress_tracker.set_current_filter(filter_name)
+                await orchestrator.run(progress_tracker=progress_tracker)
+            except Exception as e:
+                if progress_tracker:
+                    progress_tracker.log_error(
+                        f"Filter '{filter_name}' failed: {e}. Continuing with next filter."
+                    )
+                # Mark filter as stalled
+                if existing_filter:
+                    existing_filter.status = "stalled"
+                else:
+                    from .checkpoint import FilterCheckpoint
+
+                    new_filter = FilterCheckpoint(
+                        id=filter_config.get("id", ""),
+                        name=filter_name,
+                        filter_str=filter_str,
+                        status="stalled",
+                    )
+                    checkpoint.filters.append(new_filter)
+                checkpoint_manager.force_save()
+                continue
+
+            # Mark filter as complete
+            if existing_filter:
+                existing_filter.status = "complete"
+            else:
+                from .checkpoint import FilterCheckpoint
+
+                new_filter = FilterCheckpoint(
+                    id=filter_config.get("id", ""),
+                    name=filter_name,
+                    filter_str=filter_str,
+                    status="complete",
+                )
+                checkpoint.filters.append(new_filter)
+            checkpoint_manager.force_save()
+
+            if progress_tracker:
+                progress_tracker.log_info(f"Filter '{filter_name}' complete")
+
+        if progress_tracker:
+            progress_tracker.set_current_filter(None)
