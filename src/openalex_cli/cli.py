@@ -135,8 +135,20 @@ def main() -> None:
 )
 @click.option(
     "--filter",
-    "filter_str",
-    help="OpenAlex filter string (e.g., 'publication_year:>2020,type:article')",
+    "filter_strs",
+    multiple=True,
+    help="OpenAlex filter string (e.g., 'publication_year:>2020,type:article'). Can be specified multiple times.",
+)
+@click.option(
+    "--filters-file",
+    "filters_file",
+    type=click.Path(exists=True),
+    help="Path to a file containing filter strings (one per line for .txt, or JSON array for .json)",
+)
+@click.option(
+    "--resume-filter",
+    "resume_filter",
+    help="Resume a specific filter by name (requires multi-filter checkpoint)",
 )
 @click.option(
     "--content",
@@ -215,7 +227,9 @@ def download(
     storage: str,
     s3_bucket: str | None,
     s3_prefix: str,
-    filter_str: str | None,
+    filter_strs: tuple[str, ...],
+    filters_file: str | None,
+    resume_filter: str | None,
     content_types: str | None,
     nested: bool,
     ids_str: str | None,
@@ -267,6 +281,21 @@ def download(
         raise click.UsageError("--retry-workers requires --retry-failed")
     if retry_workers is not None and retry_workers <= 0:
         raise click.UsageError("--retry-workers must be greater than 0")
+
+    # Parse and validate filters
+    filters: list[str] = []
+    if filters_file and filter_strs:
+        raise click.UsageError("Cannot use both --filters-file and --filter. Choose one.")
+    if filters_file:
+        # TODO: Implement filters file parsing in Commit 2
+        raise click.UsageError("--filters-file not yet implemented. Use --filter for now.")
+    if filter_strs:
+        filters = list(filter_strs)
+    if resume_filter and len(filters) <= 1:
+        raise click.UsageError("--resume-filter requires multiple filters.")
+
+    # For backward compatibility, use single filter mode if only one filter
+    filter_str = filters[0] if len(filters) == 1 else None
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
