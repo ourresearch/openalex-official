@@ -45,6 +45,7 @@ class ProgressStats:
     retry_attempted: int = 0
     retry_recovered: int = 0
     retry_remaining: int = 0
+    current_filter: str | None = None
 
 
 class ProgressTracker:
@@ -205,6 +206,11 @@ class ProgressTracker:
         self.stats.retry_remaining = remaining
         self._refresh_display()
 
+    def set_current_filter(self, filter_name: str | None) -> None:
+        """Set the current filter being processed (for multi-filter mode)."""
+        self.stats.current_filter = filter_name
+        self._refresh_display()
+
     def log_info(self, message: str) -> None:
         """Log an info message."""
         self._logger.info(message)
@@ -261,6 +267,11 @@ class ProgressTracker:
             "Pages:",
             f"{self.stats.pages_completed} completed",
         )
+        if self.stats.current_filter:
+            table.add_row(
+                "Current filter:",
+                f"[cyan]{self.stats.current_filter}[/cyan]",
+            )
         table.add_row(
             "Unresolved failed:",
             f"{format_count(self.stats.authoritative_unresolved_failed)} works",
