@@ -24,8 +24,67 @@ class DownloadStats:
 
 
 @dataclass
+class FilterCheckpoint:
+    """Per-filter checkpoint state for multi-filter downloads."""
+
+    id: str  # hash of filter string
+    name: str
+    filter_str: str
+    expected_total_works: int | None = None
+    current_cursor: str = "*"
+    pages_completed: int = 0
+    completed_work_ids: set[str] = field(default_factory=set)
+    failed_work_ids: set[str] = field(default_factory=set)
+    stats: DownloadStats = field(default_factory=DownloadStats)
+    status: str = "active"  # active, stalled, complete
+
+    def to_dict(self) -> dict:
+        """Convert to a JSON-serializable dict."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "filter_str": self.filter_str,
+            "expected_total_works": self.expected_total_works,
+            "current_cursor": self.current_cursor,
+            "pages_completed": self.pages_completed,
+            "completed_work_ids": list(self.completed_work_ids),
+            "failed_work_ids": list(self.failed_work_ids),
+            "stats": asdict(self.stats),
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FilterCheckpoint:
+        """Create from a dict."""
+        stats_data = data.get("stats", {})
+        return cls(
+            id=data.get("id", ""),
+            name=data.get("name", ""),
+            filter_str=data.get("filter_str", ""),
+            expected_total_works=data.get("expected_total_works"),
+            current_cursor=data.get("current_cursor", "*"),
+            pages_completed=data.get("pages_completed", 0),
+            completed_work_ids=set(data.get("completed_work_ids", [])),
+            failed_work_ids=set(data.get("failed_work_ids", [])),
+            stats=DownloadStats(
+                started_at=stats_data.get("started_at", time.time()),
+                last_updated_at=stats_data.get("last_updated_at", time.time()),
+                total_downloaded=stats_data.get("total_downloaded", 0),
+                total_failed=stats_data.get("total_failed", 0),
+                total_skipped=stats_data.get("total_skipped", 0),
+                total_bytes=stats_data.get("total_bytes", 0),
+                credits_used=stats_data.get("credits_used", 0),
+            ),
+            status=data.get("status", "active"),
+        )
+
+
+@dataclass
 class Checkpoint:
     """Checkpoint state for resumable downloads."""
+
+    # Mode: "single" or "multi"
+    mode: str = "single"
 
     # Filter and format used for this download
     filter_str: str | None = None
@@ -45,9 +104,26 @@ class Checkpoint:
     # Statistics
     stats: DownloadStats = field(default_factory=DownloadStats)
 
+    # Multi-filter state
+    filters: list[FilterCheckpoint] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dict."""
+        # For backward compatibility, single-mode checkpoints use old format
+        if self.mode == "single":
+            return {
+                "filter_str": self.filter_str,
+                "content_format": self.content_format,
+                "expected_total_works": self.expected_total_works,
+                "current_cursor": self.current_cursor,
+                "pages_completed": self.pages_completed,
+                "completed_work_ids": list(self.completed_work_ids),
+                "failed_work_ids": list(self.failed_work_ids),
+                "stats": asdict(self.stats),
+            }
+
         return {
+            "mode": self.mode,
             "filter_str": self.filter_str,
             "content_format": self.content_format,
             "expected_total_works": self.expected_total_works,
@@ -56,13 +132,24 @@ class Checkpoint:
             "completed_work_ids": list(self.completed_work_ids),
             "failed_work_ids": list(self.failed_work_ids),
             "stats": asdict(self.stats),
+            "filters": [f.to_dict() for f in self.filters],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Checkpoint:
         """Create from a dict."""
         stats_data = data.get("stats", {})
+
+        # Detect mode: if no 'mode' field, it's an old single-filter checkpoint
+        mode = data.get("mode", "single")
+
+        # Parse filters if present
+        filters = []
+        if "filters" in data:
+            filters = [FilterCheckpoint.from_dict(f) for f in data["filters"]]
+
         return cls(
+            mode=mode,
             filter_str=data.get("filter_str"),
             content_format=data.get("content_format", "pdf"),
             expected_total_works=data.get("expected_total_works"),
@@ -79,6 +166,7 @@ class Checkpoint:
                 total_bytes=stats_data.get("total_bytes", 0),
                 credits_used=stats_data.get("credits_used", 0),
             ),
+            filters=filters,
         )
 
 
