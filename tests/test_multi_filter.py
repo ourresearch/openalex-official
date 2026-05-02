@@ -6,9 +6,8 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from openalex_cli.checkpoint import Checkpoint, CheckpointManager, FilterCheckpoint
+from openalex_cli.downloader import MultiFilterOrchestrator
 
 
 class TestMultiFilterCheckpoint:
@@ -185,8 +184,6 @@ class TestMultiFilterOrchestrator:
 
     def test_orchestrator_init(self):
         """MultiFilterOrchestrator should initialize with filter list."""
-        from openalex_cli.downloader import MultiFilterOrchestrator
-
         orchestrator = MultiFilterOrchestrator(
             api_key="test_key",
             output_path="/tmp/test",
@@ -201,9 +198,6 @@ class TestMultiFilterOrchestrator:
 
     def test_orchestrator_skip_complete_filter(self):
         """Orchestrator should skip filters marked as complete."""
-        from openalex_cli.downloader import MultiFilterOrchestrator
-        from openalex_cli.checkpoint import CheckpointManager
-
         with tempfile.TemporaryDirectory() as tmpdir:
             # Pre-create checkpoint with completed filter
             manager = CheckpointManager(tmpdir)
