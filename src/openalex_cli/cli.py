@@ -314,12 +314,16 @@ def download(
     if resume_filter and len(filters) <= 1:
         raise click.UsageError("--resume-filter requires multiple filters.")
 
-    # Validate filters if in multi-filter mode
-    if len(filters) > 1 and not quiet:
+    # Validate all filters (both file-based and inline)
+    if filters and not quiet:
         click.echo(f"Validating {len(filters)} filters...")
         from .filters import validate_filters
 
-        filters = asyncio.run(validate_filters(filters, api_key))
+        # Create temporary progress tracker for validation logging
+        validation_progress = ProgressTracker(output_dir=output, quiet=quiet, verbose=verbose)
+        filters = asyncio.run(
+            validate_filters(filters, api_key, progress_tracker=validation_progress)
+        )
         if not filters:
             raise click.UsageError("No valid filters found. Check your filter syntax.")
         click.echo(f"{len(filters)} filters validated successfully.")

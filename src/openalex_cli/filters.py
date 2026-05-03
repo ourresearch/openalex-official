@@ -109,6 +109,7 @@ def _parse_json_file(path: Path) -> list[dict]:
         raise ValueError(f"No filters found in {path}. 'filters' array is empty.")
 
     filters = []
+    seen_ids = set()
     for i, raw_filter in enumerate(raw_filters, 1):
         if not isinstance(raw_filter, dict):
             raise ValueError(f"Invalid filter at index {i} in {path}: expected object")
@@ -121,6 +122,14 @@ def _parse_json_file(path: Path) -> list[dict]:
         filter_id = raw_filter.get("id")
         if not filter_id:
             filter_id = _generate_filter_id(filter_str)
+
+        # Check for duplicate IDs
+        if filter_id in seen_ids:
+            raise ValueError(
+                f"Duplicate filter ID '{filter_id}' at index {i} in {path}. "
+                f"Each filter must have a unique 'id' field."
+            )
+        seen_ids.add(filter_id)
 
         # Auto-generate name if missing
         name = raw_filter.get("name")
@@ -172,18 +181,24 @@ def auto_convert_txt_to_json(txt_path: str | Path) -> Path:
     return json_path
 
 
-async def validate_filters(filters: list[dict], api_key: str) -> list[dict]:
+async def validate_filters(
+    filters: list[dict],
+    api_key: str,
+    progress_tracker=None,
+) -> list[dict]:
     """Validate filter strings by checking them against the OpenAlex API.
 
     Args:
         filters: List of filter configurations
         api_key: OpenAlex API key
+        progress_tracker: Optional progress tracker for logging warnings
 
     Returns:
         List of valid filters (invalid ones are logged and excluded)
     """
     client = OpenAlexAPIClient(api_key=api_key)
     valid_filters = []
+    warnings = []
 
     try:
         for filter_config in filters:
@@ -196,10 +211,20 @@ async def validate_filters(filters: list[dict], api_key: str) -> list[dict]:
                 if count is not None and count > 0:
                     valid_filters.append(filter_config)
                 else:
-                    print(f"Warning: Filter '{name}' returned no results, skipping: {filter_str}")
+                    msg = f"Filter '{name}' returned no results, skipping: {filter_str}"
+                    warnings.append(msg)
+                    if progress_tracker:
+                        progress_tracker.log_warning(msg)
             except Exception as e:
-                print(f"Warning: Filter '{name}' validation failed, skipping: {e}")
+                msg = f"Filter '{name}' validation failed, skipping: {e}"
+                warnings.append(msg)
+                if progress_tracker:
+                    progress_tracker.log_warning(msg)
     finally:
         await client.close()
+
+    # If no progress tracker, print warnings at end
+    if not progress_tracker and warnings:
+        print("\n".join(warnings))
 
     return valid_filters

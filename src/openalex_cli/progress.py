@@ -77,6 +77,9 @@ class ProgressTracker:
         self._progress: Progress | None = None
         self._task_id: TaskID | None = None
 
+        # Multi-filter task tracking
+        self._filter_tasks: dict[str, TaskID] = {}
+
     def _setup_logging(self) -> None:
         """Set up file and console logging."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +213,32 @@ class ProgressTracker:
         """Set the current filter being processed (for multi-filter mode)."""
         self.stats.current_filter = filter_name
         self._refresh_display()
+
+    def add_filter_task(self, filter_name: str, total: int | None = None) -> None:
+        """Add a progress task for a specific filter (multi-filter mode)."""
+        if self.is_tty and self._progress and filter_name not in self._filter_tasks:
+            task_id = self._progress.add_task(
+                f"[cyan]{filter_name}[/cyan]",
+                total=total,
+                completed=0,
+            )
+            self._filter_tasks[filter_name] = task_id
+
+    def update_filter_progress(self, filter_name: str, completed: int) -> None:
+        """Update progress for a specific filter task."""
+        if self.is_tty and self._progress and filter_name in self._filter_tasks:
+            self._progress.update(
+                self._filter_tasks[filter_name],
+                completed=completed,
+            )
+
+    def complete_filter_task(self, filter_name: str) -> None:
+        """Mark a filter task as complete."""
+        if self.is_tty and self._progress and filter_name in self._filter_tasks:
+            self._progress.update(
+                self._filter_tasks[filter_name],
+                completed=self._progress.tasks[self._filter_tasks[filter_name]].total or 1,
+            )
 
     def log_info(self, message: str) -> None:
         """Log an info message."""

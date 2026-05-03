@@ -857,6 +857,21 @@ class MultiFilterOrchestrator:
                     )
                 return
 
+        # Check for orphaned filters (in checkpoint but not in config)
+        config_filter_ids = {f.get("id", "") for f in self.filters}
+        orphaned_filters = []
+        for cp_filter in checkpoint.filters:
+            if cp_filter.id not in config_filter_ids and cp_filter.status != "orphaned":
+                orphaned_filters.append(cp_filter)
+                cp_filter.status = "orphaned"
+
+        if orphaned_filters and progress_tracker:
+            names = [f.name for f in orphaned_filters]
+            progress_tracker.log_warning(
+                f"Orphaned filters detected (removed from config): {', '.join(names)}"
+            )
+            checkpoint_manager.force_save()
+
         # Run each filter
         for filter_config in filters_to_run:
             filter_name = filter_config.get("name", "unnamed")
