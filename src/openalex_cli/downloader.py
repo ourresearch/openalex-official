@@ -861,21 +861,39 @@ class MultiFilterOrchestrator:
         for filter_config in filters_to_run:
             filter_name = filter_config.get("name", "unnamed")
             filter_str = filter_config.get("filter", "")
+            filter_id = filter_config.get("id", "")
 
             if progress_tracker:
                 progress_tracker.log_info(f"Starting filter: {filter_name}")
 
-            # Check if this filter is already complete
+            # Find existing filter by ID (hash-based matching)
             existing_filter = None
             for f in checkpoint.filters:
-                if f.filter_str == filter_str:
+                if f.id == filter_id:
                     existing_filter = f
                     break
 
-            if existing_filter and existing_filter.status == "complete":
-                if progress_tracker:
-                    progress_tracker.log_info(f"Filter '{filter_name}' already complete, skipping")
-                continue
+            # Handle stalled filters: retry them automatically
+            if existing_filter:
+                if existing_filter.status == "complete":
+                    if progress_tracker:
+                        progress_tracker.log_info(
+                            f"Filter '{filter_name}' already complete, skipping"
+                        )
+                    continue
+                elif existing_filter.status == "stalled":
+                    retry_count = getattr(existing_filter.stats, "retry_count", 0)
+                    if retry_count >= 3:
+                        if progress_tracker:
+                            progress_tracker.log_warning(
+                                f"Filter '{filter_name}' stalled after {retry_count} retries, skipping"
+                            )
+                        continue
+                    if progress_tracker:
+                        progress_tracker.log_info(
+                            f"Filter '{filter_name}' was stalled, retrying (attempt {retry_count + 1}/3)"
+                        )
+                    existing_filter.status = "active"
 
             # Create config for this filter
             config = DownloadConfig(
@@ -905,32 +923,45 @@ class MultiFilterOrchestrator:
                     progress_tracker.log_error(
                         f"Filter '{filter_name}' failed: {e}. Continuing with next filter."
                     )
-                # Mark filter as stalled
+                # Mark filter as stalled and increment retry count
                 if existing_filter:
                     existing_filter.status = "stalled"
+                    existing_filter.stats.retry_count = (
+                        getattr(existing_filter.stats, "retry_count", 0) + 1
+                    )
                 else:
                     from .checkpoint import FilterCheckpoint
 
                     new_filter = FilterCheckpoint(
-                        id=filter_config.get("id", ""),
+                        id=filter_id,
                         name=filter_name,
                         filter_str=filter_str,
                         status="stalled",
                     )
+                    new_filter.stats.retry_count = 1
                     checkpoint.filters.append(new_filter)
                 checkpoint_manager.force_save()
                 continue
 
-            # Mark filter as complete
+            # Sync per-filter state from child orchestrator
+            child_checkpoint = orchestrator.checkpoint_manager.get()
             if existing_filter:
+                existing_filter.completed_work_ids.update(child_checkpoint.completed_work_ids)
+                existing_filter.failed_work_ids.update(child_checkpoint.failed_work_ids)
+                existing_filter.current_cursor = child_checkpoint.current_cursor
+                existing_filter.pages_completed = child_checkpoint.pages_completed
                 existing_filter.status = "complete"
             else:
                 from .checkpoint import FilterCheckpoint
 
                 new_filter = FilterCheckpoint(
-                    id=filter_config.get("id", ""),
+                    id=filter_id,
                     name=filter_name,
                     filter_str=filter_str,
+                    completed_work_ids=set(child_checkpoint.completed_work_ids),
+                    failed_work_ids=set(child_checkpoint.failed_work_ids),
+                    current_cursor=child_checkpoint.current_cursor,
+                    pages_completed=child_checkpoint.pages_completed,
                     status="complete",
                 )
                 checkpoint.filters.append(new_filter)

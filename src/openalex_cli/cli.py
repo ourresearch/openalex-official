@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import click
 
 from . import __version__
 from .api_client import OpenAlexAPIClient
-from .downloader import DownloadConfig, DownloadOrchestrator
+from .downloader import DownloadConfig, DownloadOrchestrator, MultiFilterOrchestrator
 from .progress import ProgressTracker
 from .utils import ContentFormat, StorageType, parse_identifier
 
@@ -283,19 +284,48 @@ def download(
         raise click.UsageError("--retry-workers must be greater than 0")
 
     # Parse and validate filters
-    filters: list[str] = []
+    filters: list[dict] = []
     if filters_file and filter_strs:
         raise click.UsageError("Cannot use both --filters-file and --filter. Choose one.")
     if filters_file:
-        # TODO: Implement filters file parsing in Commit 2
-        raise click.UsageError("--filters-file not yet implemented. Use --filter for now.")
+        from .filters import auto_convert_txt_to_json, parse_filters_file
+
+        filters_path = Path(filters_file)
+        try:
+            filters = parse_filters_file(filters_path)
+            # Auto-convert .txt to .json sidecar
+            if filters_path.suffix.lower() == ".txt":
+                json_path = auto_convert_txt_to_json(filters_path)
+                if not quiet:
+                    click.echo(f"Auto-generated filter config: {json_path}")
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
     if filter_strs:
-        filters = list(filter_strs)
+        from .filters import _generate_filter_id
+
+        for i, filter_str in enumerate(filter_strs, 1):
+            filters.append(
+                {
+                    "id": _generate_filter_id(filter_str),
+                    "name": f"filter_{i:03d}",
+                    "filter": filter_str,
+                }
+            )
     if resume_filter and len(filters) <= 1:
         raise click.UsageError("--resume-filter requires multiple filters.")
 
+    # Validate filters if in multi-filter mode
+    if len(filters) > 1 and not quiet:
+        click.echo(f"Validating {len(filters)} filters...")
+        from .filters import validate_filters
+
+        filters = asyncio.run(validate_filters(filters, api_key))
+        if not filters:
+            raise click.UsageError("No valid filters found. Check your filter syntax.")
+        click.echo(f"{len(filters)} filters validated successfully.")
+
     # For backward compatibility, use single filter mode if only one filter
-    filter_str = filters[0] if len(filters) == 1 else None
+    single_filter: str | None = str(filters[0]["filter"]) if len(filters) == 1 else None
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
@@ -340,7 +370,7 @@ def download(
             raise click.UsageError("--retry-failed is not supported with --stdin")
 
     # Warn if no filter and no IDs provided
-    if not filter_str and not work_ids:
+    if not single_filter and not work_ids:
         # Detect piped stdin without --stdin flag
         if not sys.stdin.isatty() and not use_stdin:
             click.echo(
@@ -369,7 +399,7 @@ def download(
         storage_type=StorageType.S3 if storage == "s3" else StorageType.LOCAL,
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
-        filter_str=filter_str,
+        filter_str=single_filter,
         content_format=content_format,
         workers=workers,
         resume=resume,
@@ -392,8 +422,28 @@ def download(
         verbose=verbose,
     )
 
-    # Create orchestrator and run
-    orchestrator = DownloadOrchestrator(config)
+    # Route to multi-filter or single-filter orchestrator
+    orchestrator: MultiFilterOrchestrator | DownloadOrchestrator
+    if len(filters) > 1:
+        # Multi-filter mode
+        orchestrator = MultiFilterOrchestrator(
+            api_key=api_key,
+            output_path=output,
+            filters=filters,
+            content_format=content_format,
+            workers=workers,
+            resume=resume,
+            fresh=fresh,
+            quiet=quiet,
+            verbose=verbose,
+            nested=nested,
+            retry_failed=retry_failed,
+            retry_workers=retry_workers,
+            resume_filter=resume_filter,
+        )
+    else:
+        # Single-filter mode (backward compatible)
+        orchestrator = DownloadOrchestrator(config)
 
     try:
         progress.start()
@@ -403,7 +453,9 @@ def download(
     finally:
         progress.stop()
 
-    if orchestrator._credits_exhausted:
+    # Check credits exhausted (works for both orchestrator types)
+    credits_exhausted = getattr(orchestrator, "_credits_exhausted", False)
+    if credits_exhausted:
         sys.exit(1)
 
 

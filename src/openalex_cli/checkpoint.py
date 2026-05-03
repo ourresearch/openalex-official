@@ -21,6 +21,7 @@ class DownloadStats:
     total_skipped: int = 0
     total_bytes: int = 0
     credits_used: int = 0
+    retry_count: int = 0
 
 
 @dataclass
