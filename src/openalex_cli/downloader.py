@@ -865,11 +865,12 @@ class MultiFilterOrchestrator:
                 orphaned_filters.append(cp_filter)
                 cp_filter.status = "orphaned"
 
-        if orphaned_filters and progress_tracker:
-            names = [f.name for f in orphaned_filters]
-            progress_tracker.log_warning(
-                f"Orphaned filters detected (removed from config): {', '.join(names)}"
-            )
+        if orphaned_filters:
+            if progress_tracker:
+                names = [f.name for f in orphaned_filters]
+                progress_tracker.log_warning(
+                    f"Orphaned filters detected (removed from config): {', '.join(names)}"
+                )
             checkpoint_manager.force_save()
 
         # Run each filter
@@ -938,6 +939,10 @@ class MultiFilterOrchestrator:
                     progress_tracker.log_error(
                         f"Filter '{filter_name}' failed: {e}. Continuing with next filter."
                     )
+                # Reload checkpoint to get child's partial progress
+                checkpoint_manager.load()
+                checkpoint = checkpoint_manager.get()
+
                 # Mark filter as stalled and increment retry count
                 if existing_filter:
                     existing_filter.status = "stalled"
@@ -957,6 +962,17 @@ class MultiFilterOrchestrator:
                     checkpoint.filters.append(new_filter)
                 checkpoint_manager.force_save()
                 continue
+
+            # Reload checkpoint to get child's final state (avoids race condition)
+            checkpoint_manager.load()
+            checkpoint = checkpoint_manager.get()
+
+            # Re-find existing filter after reload
+            existing_filter = None
+            for f in checkpoint.filters:
+                if f.id == filter_id:
+                    existing_filter = f
+                    break
 
             # Sync per-filter state from child orchestrator
             child_checkpoint = orchestrator.checkpoint_manager.get()

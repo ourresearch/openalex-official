@@ -319,11 +319,7 @@ def download(
         click.echo(f"Validating {len(filters)} filters...")
         from .filters import validate_filters
 
-        # Create temporary progress tracker for validation logging
-        validation_progress = ProgressTracker(output_dir=output, quiet=quiet, verbose=verbose)
-        filters = asyncio.run(
-            validate_filters(filters, api_key, progress_tracker=validation_progress)
-        )
+        filters = asyncio.run(validate_filters(filters, api_key, progress_tracker=None))
         if not filters:
             raise click.UsageError("No valid filters found. Check your filter syntax.")
         click.echo(f"{len(filters)} filters validated successfully.")

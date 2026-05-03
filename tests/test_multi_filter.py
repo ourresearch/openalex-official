@@ -6,6 +6,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from openalex_cli.checkpoint import Checkpoint, CheckpointManager, FilterCheckpoint
 from openalex_cli.downloader import MultiFilterOrchestrator
 
@@ -237,3 +239,87 @@ class TestMultiFilterOrchestrator:
         # This is a contract test for the ID generation logic
         assert len(expected_hash) == 8
         assert expected_hash.isalnum()
+
+
+class TestFilterParsingEdgeCases:
+    """Test edge cases in filter file parsing."""
+
+    def test_duplicate_id_detection(self):
+        """JSON files with duplicate IDs should raise error."""
+        from openalex_cli.filters import _parse_json_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "filters.json"
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "filters": [
+                            {"id": "same_id", "name": "f1", "filter": "year:2024"},
+                            {"id": "same_id", "name": "f2", "filter": "year:2023"},
+                        ]
+                    }
+                )
+            )
+
+            with pytest.raises(ValueError, match="Duplicate filter ID"):
+                _parse_json_file(json_path)
+
+    def test_inline_filter_generation(self):
+        """Inline --filter arguments should generate proper config."""
+        from openalex_cli.filters import _generate_filter_id
+
+        filter_str = "publication_year:>2020"
+        filter_id = _generate_filter_id(filter_str)
+
+        assert len(filter_id) == 8
+        assert filter_id.isalnum()
+        # Same filter should generate same ID
+        assert _generate_filter_id(filter_str) == filter_id
+
+
+class TestOrphanedFilterHandling:
+    """Test orphaned filter detection and cleanup."""
+
+    def test_orphaned_filter_marked_in_checkpoint(self):
+        """Filters in checkpoint but not in config should be marked orphaned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create checkpoint with filter that's not in config
+            manager = CheckpointManager(tmpdir)
+            checkpoint = manager.create()
+            checkpoint.mode = "multi"
+            checkpoint.filters = [
+                FilterCheckpoint(
+                    id="orphan_001",
+                    name="old_filter",
+                    filter_str="year:2022",
+                    status="complete",
+                ),
+                FilterCheckpoint(
+                    id="active_001",
+                    name="current_filter",
+                    filter_str="year:2024",
+                    status="active",
+                ),
+            ]
+            manager.force_save()
+
+            # Create orchestrator with only one filter (orphaning the other)
+            orchestrator = MultiFilterOrchestrator(
+                api_key="test_key",
+                output_path=tmpdir,
+                filters=[
+                    {"id": "active_001", "name": "current_filter", "filter": "year:2024"},
+                ],
+            )
+
+            import asyncio
+
+            asyncio.run(orchestrator.run())
+
+            # Reload and check
+            loaded = manager.load()
+            assert loaded is not None
+            assert len(loaded.filters) == 2
+
+            orphan = next(f for f in loaded.filters if f.id == "orphan_001")
+            assert orphan.status == "orphaned"
