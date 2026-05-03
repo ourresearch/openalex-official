@@ -25,8 +25,9 @@ class TestLocalStorage:
 
     async def test_get_full_path(self, storage):
         path = storage.get_full_path("test/file.pdf")
-        assert path.endswith("test/file.pdf")
-        assert Path(path).is_absolute()
+        path_obj = Path(path)
+        assert path_obj.is_absolute()
+        assert path_obj.parts[-2:] == ("test", "file.pdf")
 
     async def test_overwrite_existing(self, storage):
         await storage.save("test.pdf", b"original")

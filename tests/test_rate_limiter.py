@@ -1,7 +1,5 @@
 """Tests for adaptive rate limiter."""
 
-import asyncio
-
 import pytest
 
 from openalex_cli.rate_limiter import AdaptiveRateLimiter, APIHealth

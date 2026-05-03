@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .state_io import atomic_write_json
+
 
 @dataclass
 class DownloadStats:
@@ -19,15 +21,76 @@ class DownloadStats:
     total_skipped: int = 0
     total_bytes: int = 0
     credits_used: int = 0
+    retry_count: int = 0
+
+
+@dataclass
+class FilterCheckpoint:
+    """Per-filter checkpoint state for multi-filter downloads."""
+
+    id: str  # hash of filter string
+    name: str
+    filter_str: str
+    expected_total_works: int | None = None
+    current_cursor: str = "*"
+    pages_completed: int = 0
+    completed_work_ids: set[str] = field(default_factory=set)
+    failed_work_ids: set[str] = field(default_factory=set)
+    stats: DownloadStats = field(default_factory=DownloadStats)
+    status: str = "active"  # active, stalled, complete
+
+    def to_dict(self) -> dict:
+        """Convert to a JSON-serializable dict."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "filter_str": self.filter_str,
+            "expected_total_works": self.expected_total_works,
+            "current_cursor": self.current_cursor,
+            "pages_completed": self.pages_completed,
+            "completed_work_ids": list(self.completed_work_ids),
+            "failed_work_ids": list(self.failed_work_ids),
+            "stats": asdict(self.stats),
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FilterCheckpoint:
+        """Create from a dict."""
+        stats_data = data.get("stats", {})
+        return cls(
+            id=data.get("id", ""),
+            name=data.get("name", ""),
+            filter_str=data.get("filter_str", ""),
+            expected_total_works=data.get("expected_total_works"),
+            current_cursor=data.get("current_cursor", "*"),
+            pages_completed=data.get("pages_completed", 0),
+            completed_work_ids=set(data.get("completed_work_ids", [])),
+            failed_work_ids=set(data.get("failed_work_ids", [])),
+            stats=DownloadStats(
+                started_at=stats_data.get("started_at", time.time()),
+                last_updated_at=stats_data.get("last_updated_at", time.time()),
+                total_downloaded=stats_data.get("total_downloaded", 0),
+                total_failed=stats_data.get("total_failed", 0),
+                total_skipped=stats_data.get("total_skipped", 0),
+                total_bytes=stats_data.get("total_bytes", 0),
+                credits_used=stats_data.get("credits_used", 0),
+            ),
+            status=data.get("status", "active"),
+        )
 
 
 @dataclass
 class Checkpoint:
     """Checkpoint state for resumable downloads."""
 
+    # Mode: "single" or "multi"
+    mode: str = "single"
+
     # Filter and format used for this download
     filter_str: str | None = None
     content_format: str = "pdf"
+    expected_total_works: int | None = None
 
     # Pagination state
     current_cursor: str = "*"
@@ -42,25 +105,55 @@ class Checkpoint:
     # Statistics
     stats: DownloadStats = field(default_factory=DownloadStats)
 
+    # Multi-filter state
+    filters: list[FilterCheckpoint] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dict."""
+        # For backward compatibility, single-mode checkpoints use old format
+        if self.mode == "single":
+            return {
+                "filter_str": self.filter_str,
+                "content_format": self.content_format,
+                "expected_total_works": self.expected_total_works,
+                "current_cursor": self.current_cursor,
+                "pages_completed": self.pages_completed,
+                "completed_work_ids": list(self.completed_work_ids),
+                "failed_work_ids": list(self.failed_work_ids),
+                "stats": asdict(self.stats),
+            }
+
         return {
+            "mode": self.mode,
             "filter_str": self.filter_str,
             "content_format": self.content_format,
+            "expected_total_works": self.expected_total_works,
             "current_cursor": self.current_cursor,
             "pages_completed": self.pages_completed,
             "completed_work_ids": list(self.completed_work_ids),
             "failed_work_ids": list(self.failed_work_ids),
             "stats": asdict(self.stats),
+            "filters": [f.to_dict() for f in self.filters],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Checkpoint:
         """Create from a dict."""
         stats_data = data.get("stats", {})
+
+        # Detect mode: if no 'mode' field, it's an old single-filter checkpoint
+        mode = data.get("mode", "single")
+
+        # Parse filters if present
+        filters = []
+        if "filters" in data:
+            filters = [FilterCheckpoint.from_dict(f) for f in data["filters"]]
+
         return cls(
+            mode=mode,
             filter_str=data.get("filter_str"),
             content_format=data.get("content_format", "pdf"),
+            expected_total_works=data.get("expected_total_works"),
             current_cursor=data.get("current_cursor", "*"),
             pages_completed=data.get("pages_completed", 0),
             completed_work_ids=set(data.get("completed_work_ids", [])),
@@ -74,6 +167,7 @@ class Checkpoint:
                 total_bytes=stats_data.get("total_bytes", 0),
                 credits_used=stats_data.get("credits_used", 0),
             ),
+            filters=filters,
         )
 
 
@@ -109,7 +203,7 @@ class CheckpointManager:
                 data = json.load(f)
             self._checkpoint = Checkpoint.from_dict(data)
             return self._checkpoint
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError):
             # Corrupted checkpoint - return None to start fresh
             return None
 
@@ -117,11 +211,13 @@ class CheckpointManager:
         self,
         filter_str: str | None = None,
         content_format: str = "pdf",
+        expected_total_works: int | None = None,
     ) -> Checkpoint:
         """Create a new checkpoint."""
         self._checkpoint = Checkpoint(
             filter_str=filter_str,
             content_format=content_format,
+            expected_total_works=expected_total_works,
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._save()
@@ -171,6 +267,59 @@ class CheckpointManager:
         """Check if a work ID has already been completed."""
         return work_id in self.get().completed_work_ids
 
+    def get_failed_work_ids(self) -> list[str]:
+        """Return unresolved failed work IDs in stable order."""
+        return sorted(self.get().failed_work_ids)
+
+    def resolve_failed_work(self, work_id: str, file_size: int, credits: int) -> None:
+        """Move a failed work into the completed set after a successful retry."""
+        checkpoint = self.get()
+        checkpoint.failed_work_ids.discard(work_id)
+        checkpoint.completed_work_ids.add(work_id)
+        checkpoint.stats.total_downloaded += 1
+        checkpoint.stats.total_bytes += file_size
+        checkpoint.stats.credits_used += credits
+        checkpoint.stats.last_updated_at = time.time()
+        self._maybe_save()
+
+    def record_failed_retry(self, work_id: str) -> None:
+        """Keep a failed work unresolved after another failed retry attempt."""
+        checkpoint = self.get()
+        checkpoint.failed_work_ids.add(work_id)
+        checkpoint.stats.last_updated_at = time.time()
+        self._maybe_save()
+
+    def terminal_work_ids(self) -> set[str]:
+        """Return all work IDs with a committed terminal outcome."""
+        checkpoint = self.get()
+        return checkpoint.completed_work_ids | checkpoint.failed_work_ids
+
+    def commit_page(
+        self,
+        cursor: str | None,
+        completed_entries: list[tuple[str, int, int]],
+        failed_work_ids: list[str],
+    ) -> None:
+        """Commit a fully terminal page and advance the durable cursor."""
+        checkpoint = self.get()
+
+        for work_id, file_size, credits in completed_entries:
+            checkpoint.completed_work_ids.add(work_id)
+            checkpoint.failed_work_ids.discard(work_id)
+            checkpoint.stats.total_downloaded += 1
+            checkpoint.stats.total_bytes += file_size
+            checkpoint.stats.credits_used += credits
+
+        for work_id in failed_work_ids:
+            checkpoint.failed_work_ids.add(work_id)
+            checkpoint.stats.total_failed += 1
+
+        checkpoint.current_cursor = cursor or "*"
+        checkpoint.pages_completed += 1
+        checkpoint.stats.last_updated_at = time.time()
+        self._save()
+        self._pending_saves = 0
+
     def _maybe_save(self) -> None:
         """Save checkpoint if threshold reached."""
         self._pending_saves += 1
@@ -182,8 +331,7 @@ class CheckpointManager:
         """Save checkpoint to disk."""
         checkpoint = self.get()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.checkpoint_path, "w") as f:
-            json.dump(checkpoint.to_dict(), f, indent=2)
+        atomic_write_json(self.checkpoint_path, checkpoint.to_dict())
 
     def force_save(self) -> None:
         """Force an immediate save (e.g., on shutdown)."""

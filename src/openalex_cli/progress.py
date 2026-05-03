@@ -7,6 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.live import Live
@@ -37,6 +38,14 @@ class ProgressStats:
     start_time: float = 0.0
     pages_completed: int = 0
     current_cursor: str | None = None
+    expected_total_works: int | None = None
+    starting_completed: int = 0
+    authoritative_completed: int = 0
+    authoritative_unresolved_failed: int = 0
+    retry_attempted: int = 0
+    retry_recovered: int = 0
+    retry_remaining: int = 0
+    current_filter: str | None = None
 
 
 class ProgressTracker:
@@ -67,6 +76,9 @@ class ProgressTracker:
         self._live: Live | None = None
         self._progress: Progress | None = None
         self._task_id: TaskID | None = None
+
+        # Multi-filter task tracking
+        self._filter_tasks: dict[str, TaskID] = {}
 
     def _setup_logging(self) -> None:
         """Set up file and console logging."""
@@ -164,6 +176,70 @@ class ProgressTracker:
         self.stats.current_cursor = cursor
         self._refresh_display()
 
+    def initialize_totals(
+        self,
+        starting_completed: int,
+        expected_total_works: int | None,
+    ) -> None:
+        """Initialize total progress tracking for a new or resumed run."""
+        self.stats.starting_completed = starting_completed
+        self.stats.expected_total_works = expected_total_works
+        self.stats.authoritative_completed = starting_completed
+
+        if self._progress and self._task_id is not None and expected_total_works is not None:
+            self._progress.update(self._task_id, total=expected_total_works)
+
+        self._refresh_display()
+
+    def sync_checkpoint_state(
+        self,
+        completed_count: int,
+        unresolved_failed_count: int | None = None,
+    ) -> None:
+        """Sync progress display with durable checkpoint state."""
+        self.stats.authoritative_completed = completed_count
+        if unresolved_failed_count is not None:
+            self.stats.authoritative_unresolved_failed = unresolved_failed_count
+        self._refresh_display()
+
+    def record_retry_summary(self, attempted: int, recovered: int, remaining: int) -> None:
+        """Record the outcome of the failed-work retry phase."""
+        self.stats.retry_attempted = attempted
+        self.stats.retry_recovered = recovered
+        self.stats.retry_remaining = remaining
+        self._refresh_display()
+
+    def set_current_filter(self, filter_name: str | None) -> None:
+        """Set the current filter being processed (for multi-filter mode)."""
+        self.stats.current_filter = filter_name
+        self._refresh_display()
+
+    def add_filter_task(self, filter_name: str, total: int | None = None) -> None:
+        """Add a progress task for a specific filter (multi-filter mode)."""
+        if self.is_tty and self._progress and filter_name not in self._filter_tasks:
+            task_id = self._progress.add_task(
+                f"[cyan]{filter_name}[/cyan]",
+                total=total,
+                completed=0,
+            )
+            self._filter_tasks[filter_name] = task_id
+
+    def update_filter_progress(self, filter_name: str, completed: int) -> None:
+        """Update progress for a specific filter task."""
+        if self.is_tty and self._progress and filter_name in self._filter_tasks:
+            self._progress.update(
+                self._filter_tasks[filter_name],
+                completed=completed,
+            )
+
+    def complete_filter_task(self, filter_name: str) -> None:
+        """Mark a filter task as complete."""
+        if self.is_tty and self._progress and filter_name in self._filter_tasks:
+            self._progress.update(
+                self._filter_tasks[filter_name],
+                completed=self._progress.tasks[self._filter_tasks[filter_name]].total or 1,
+            )
+
     def log_info(self, message: str) -> None:
         """Log an info message."""
         self._logger.info(message)
@@ -186,7 +262,10 @@ class ProgressTracker:
         """Refresh the Rich display."""
         if self._live and self._progress and self._task_id is not None:
             stats = self._format_stats()
-            self._progress.update(self._task_id, stats=stats)
+            update_kwargs: dict[str, Any] = {"stats": stats}
+            if self.stats.expected_total_works is not None:
+                update_kwargs["completed"] = self.stats.authoritative_completed
+            self._progress.update(self._task_id, **update_kwargs)
             self._live.update(self._make_display())
 
     def _make_display(self) -> Panel:
@@ -217,6 +296,32 @@ class ProgressTracker:
             "Pages:",
             f"{self.stats.pages_completed} completed",
         )
+        if self.stats.current_filter:
+            table.add_row(
+                "Current filter:",
+                f"[cyan]{self.stats.current_filter}[/cyan]",
+            )
+        table.add_row(
+            "Unresolved failed:",
+            f"{format_count(self.stats.authoritative_unresolved_failed)} works",
+        )
+
+        if self.stats.expected_total_works is not None:
+            completed = self.stats.authoritative_completed
+            remaining = max(self.stats.expected_total_works - completed, 0)
+            percent = (
+                completed / self.stats.expected_total_works
+                if self.stats.expected_total_works
+                else 0
+            )
+            table.add_row(
+                "Progress:",
+                f"{format_count(completed)} / {format_count(self.stats.expected_total_works)} ({percent:.1%})",
+            )
+            table.add_row(
+                "Remaining:",
+                f"{format_count(remaining)} works",
+            )
 
         # API health
         if self._rate_state:
@@ -262,6 +367,13 @@ class ProgressTracker:
         """Format stats for the progress bar."""
         elapsed = time.time() - self.stats.start_time
         files_per_sec = self.stats.total_downloaded / elapsed if elapsed > 0 else 0
+        if self.stats.expected_total_works is not None:
+            completed = self.stats.authoritative_completed
+            return (
+                f"{format_count(completed)} / {format_count(self.stats.expected_total_works)} • "
+                f"{format_count(self.stats.total_failed)} failed • "
+                f"{files_per_sec:.1f}/s"
+            )
         return (
             f"{format_count(self.stats.total_downloaded)} OK • "
             f"{format_count(self.stats.total_failed)} failed • "
@@ -293,6 +405,13 @@ class ProgressTracker:
             f"  Duration: {elapsed:.1f}s\n"
             f"  Average speed: {format_rate(rate)}"
         )
+
+        if self.stats.retry_attempted:
+            summary += (
+                f"\n  Retry recovery: {format_count(self.stats.retry_recovered)} / "
+                f"{format_count(self.stats.retry_attempted)} succeeded"
+                f" ({format_count(self.stats.retry_remaining)} unresolved remaining)"
+            )
 
         self._logger.info(summary)
         if self.is_tty:

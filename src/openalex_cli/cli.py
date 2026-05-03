@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import click
 
 from . import __version__
 from .api_client import OpenAlexAPIClient
-from .downloader import DownloadConfig, DownloadOrchestrator
+from .downloader import DownloadConfig, DownloadOrchestrator, MultiFilterOrchestrator
 from .progress import ProgressTracker
 from .utils import ContentFormat, StorageType, parse_identifier
 
@@ -81,8 +82,7 @@ async def _resolve_identifiers(
                     original_map[work_id] = doi  # Remember original DOI for filename
                 elif not quiet:
                     click.echo(
-                        click.style("Warning: ", fg="yellow")
-                        + f"DOI not found in OpenAlex: {doi}"
+                        click.style("Warning: ", fg="yellow") + f"DOI not found in OpenAlex: {doi}"
                     )
         finally:
             await client.close()
@@ -136,8 +136,20 @@ def main() -> None:
 )
 @click.option(
     "--filter",
-    "filter_str",
-    help="OpenAlex filter string (e.g., 'publication_year:>2020,type:article')",
+    "filter_strs",
+    multiple=True,
+    help="OpenAlex filter string (e.g., 'publication_year:>2020,type:article'). Can be specified multiple times.",
+)
+@click.option(
+    "--filters-file",
+    "filters_file",
+    type=click.Path(exists=True),
+    help="Path to a file containing filter strings (one per line for .txt, or JSON array for .json)",
+)
+@click.option(
+    "--resume-filter",
+    "resume_filter",
+    help="Resume a specific filter by name (requires multi-filter checkpoint)",
 )
 @click.option(
     "--content",
@@ -165,6 +177,17 @@ def main() -> None:
     default=50,
     help="Number of concurrent download workers",
     type=click.IntRange(1, 200),
+)
+@click.option(
+    "--retry-failed",
+    is_flag=True,
+    help="Retry unresolved failed metadata downloads after the main run.",
+)
+@click.option(
+    "--retry-workers",
+    type=int,
+    default=None,
+    help="Worker count for the failed-ID retry phase.",
 )
 @click.option(
     "--resume/--no-resume",
@@ -205,12 +228,16 @@ def download(
     storage: str,
     s3_bucket: str | None,
     s3_prefix: str,
-    filter_str: str | None,
+    filter_strs: tuple[str, ...],
+    filters_file: str | None,
+    resume_filter: str | None,
     content_types: str | None,
     nested: bool,
     ids_str: str | None,
     use_stdin: bool,
     workers: int,
+    retry_failed: bool,
+    retry_workers: int | None,
     resume: bool,
     fresh: bool,
     sample_size: int | None,
@@ -251,6 +278,54 @@ def download(
         raise click.UsageError("--sample cannot be used with --ids or --stdin")
     if seed is not None and not sample_size:
         raise click.UsageError("--seed requires --sample")
+    if retry_workers is not None and not retry_failed:
+        raise click.UsageError("--retry-workers requires --retry-failed")
+    if retry_workers is not None and retry_workers <= 0:
+        raise click.UsageError("--retry-workers must be greater than 0")
+
+    # Parse and validate filters
+    filters: list[dict] = []
+    if filters_file and filter_strs:
+        raise click.UsageError("Cannot use both --filters-file and --filter. Choose one.")
+    if filters_file:
+        from .filters import auto_convert_txt_to_json, parse_filters_file
+
+        filters_path = Path(filters_file)
+        try:
+            filters = parse_filters_file(filters_path)
+            # Auto-convert .txt to .json sidecar
+            if filters_path.suffix.lower() == ".txt":
+                json_path = auto_convert_txt_to_json(filters_path)
+                if not quiet:
+                    click.echo(f"Auto-generated filter config: {json_path}")
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
+    if filter_strs:
+        from .filters import _generate_filter_id
+
+        for i, filter_str in enumerate(filter_strs, 1):
+            filters.append(
+                {
+                    "id": _generate_filter_id(filter_str),
+                    "name": f"filter_{i:03d}",
+                    "filter": filter_str,
+                }
+            )
+    if resume_filter and len(filters) <= 1:
+        raise click.UsageError("--resume-filter requires multiple filters.")
+
+    # Validate all filters (both file-based and inline)
+    if filters and not quiet:
+        click.echo(f"Validating {len(filters)} filters...")
+        from .filters import validate_filters
+
+        filters = asyncio.run(validate_filters(filters, api_key, progress_tracker=None))
+        if not filters:
+            raise click.UsageError("No valid filters found. Check your filter syntax.")
+        click.echo(f"{len(filters)} filters validated successfully.")
+
+    # For backward compatibility, use single filter mode if only one filter
+    single_filter: str | None = str(filters[0]["filter"]) if len(filters) == 1 else None
 
     # Parse IDs from stdin or --ids option
     work_ids: list[str] | None = None
@@ -260,20 +335,15 @@ def download(
         raw_ids = _parse_input_ids(ids_str, use_stdin)
         if not raw_ids:
             click.echo(
-                click.style("Error: ", fg="red")
-                + "No work IDs provided. Check your input.",
+                click.style("Error: ", fg="red") + "No work IDs provided. Check your input.",
                 err=True,
             )
             if use_stdin:
                 click.echo("  stdin was empty — verify your pipe or input file.", err=True)
             sys.exit(1)
-        work_ids, original_identifiers = asyncio.run(
-            _resolve_identifiers(raw_ids, api_key, quiet)
-        )
+        work_ids, original_identifiers = asyncio.run(_resolve_identifiers(raw_ids, api_key, quiet))
         if not work_ids:
-            click.echo(
-                click.style("Error: ", fg="red") + "No valid work IDs found.", err=True
-            )
+            click.echo(click.style("Error: ", fg="red") + "No valid work IDs found.", err=True)
             sys.exit(1)
         if not quiet:
             click.echo(f"Found {len(work_ids)} work(s) to download.")
@@ -282,17 +352,25 @@ def download(
     content_format = ContentFormat.NONE
     if content_types:
         types = [t.strip().lower() for t in content_types.split(",")]
-        if "pdf" in types and "xml" in types:
-            content_format = ContentFormat.BOTH
-        elif "both" in types:
+        if ("pdf" in types and "xml" in types) or "both" in types:
             content_format = ContentFormat.BOTH
         elif "pdf" in types:
             content_format = ContentFormat.PDF
         elif "xml" in types:
             content_format = ContentFormat.XML
 
+    if retry_failed:
+        if content_format != ContentFormat.NONE:
+            raise click.UsageError("--retry-failed currently supports metadata-only downloads only")
+        if sample_size:
+            raise click.UsageError("--retry-failed is not supported with --sample")
+        if ids_str:
+            raise click.UsageError("--retry-failed is not supported with --ids")
+        if use_stdin:
+            raise click.UsageError("--retry-failed is not supported with --stdin")
+
     # Warn if no filter and no IDs provided
-    if not filter_str and not work_ids:
+    if not single_filter and not work_ids:
         # Detect piped stdin without --stdin flag
         if not sys.stdin.isatty() and not use_stdin:
             click.echo(
@@ -321,7 +399,7 @@ def download(
         storage_type=StorageType.S3 if storage == "s3" else StorageType.LOCAL,
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
-        filter_str=filter_str,
+        filter_str=single_filter,
         content_format=content_format,
         workers=workers,
         resume=resume,
@@ -333,6 +411,8 @@ def download(
         original_identifiers=original_identifiers,
         sample=sample_size,
         seed=seed,
+        retry_failed=retry_failed,
+        retry_workers=retry_workers,
     )
 
     # Create progress tracker
@@ -342,8 +422,28 @@ def download(
         verbose=verbose,
     )
 
-    # Create orchestrator and run
-    orchestrator = DownloadOrchestrator(config)
+    # Route to multi-filter or single-filter orchestrator
+    orchestrator: MultiFilterOrchestrator | DownloadOrchestrator
+    if len(filters) > 1:
+        # Multi-filter mode
+        orchestrator = MultiFilterOrchestrator(
+            api_key=api_key,
+            output_path=output,
+            filters=filters,
+            content_format=content_format,
+            workers=workers,
+            resume=resume,
+            fresh=fresh,
+            quiet=quiet,
+            verbose=verbose,
+            nested=nested,
+            retry_failed=retry_failed,
+            retry_workers=retry_workers,
+            resume_filter=resume_filter,
+        )
+    else:
+        # Single-filter mode (backward compatible)
+        orchestrator = DownloadOrchestrator(config)
 
     try:
         progress.start()
@@ -353,7 +453,9 @@ def download(
     finally:
         progress.stop()
 
-    if orchestrator._credits_exhausted:
+    # Check credits exhausted (works for both orchestrator types)
+    credits_exhausted = getattr(orchestrator, "_credits_exhausted", False)
+    if credits_exhausted:
         sys.exit(1)
 
 
@@ -372,7 +474,7 @@ def status(api_key: str) -> None:
         client = OpenAlexAPIClient(api_key=api_key)
         try:
             status = await client.get_status()
-            click.echo(f"API Key Status:")
+            click.echo("API Key Status:")
             click.echo(f"  Rate limit remaining: {status.rate_limit_remaining:,}")
             click.echo()
             click.echo("Note: Full credit information requires a premium API key.")
