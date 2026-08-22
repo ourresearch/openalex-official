@@ -4,9 +4,9 @@
 import asyncio
 import os
 
-from openalex_content.downloader import DownloadConfig, DownloadOrchestrator
-from openalex_content.progress import ProgressTracker
-from openalex_content.utils import ContentFormat, StorageType
+from openalex_cli.downloader import DownloadConfig, DownloadOrchestrator
+from openalex_cli.progress import ProgressTracker
+from openalex_cli.utils import ContentFormat, StorageType
 
 
 async def main():
@@ -25,7 +25,6 @@ async def main():
         # Filter: machine learning articles from 2023+
         filter_str="topics.id:T10207,publication_year:>2022",
         content_format=ContentFormat.XML,
-        with_metadata=True,  # Include JSON metadata
         workers=30,
     )
 

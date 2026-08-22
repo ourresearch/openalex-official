@@ -4,10 +4,9 @@
 import asyncio
 import os
 
-from openalex_content.api_client import OpenAlexAPIClient
-from openalex_content.downloader import DownloadConfig, DownloadOrchestrator
-from openalex_content.progress import ProgressTracker
-from openalex_content.utils import ContentFormat, StorageType
+from openalex_cli.downloader import DownloadConfig, DownloadOrchestrator
+from openalex_cli.progress import ProgressTracker
+from openalex_cli.utils import ContentFormat, StorageType
 
 
 async def main():
