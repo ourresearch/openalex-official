@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
@@ -295,7 +296,9 @@ class OpenAlexAPIClient:
         """
         Download content for a specific work.
 
-        Follows the redirect to the signed R2 URL and downloads the content.
+        The content API streams the file directly (200). Older deployments
+        answered with a 302 to a presigned bucket URL; that path is kept so the
+        client keeps working against either.
         """
         session = await self._get_session()
 
@@ -334,7 +337,7 @@ class OpenAlexAPIClient:
                         rate_limit_remaining=remaining,
                     )
 
-                if response.status not in (301, 302, 307, 308):
+                if response.status not in (200, 301, 302, 307, 308):
                     return DownloadResult(
                         work_id=work_id,
                         format=content_format,
@@ -347,7 +350,11 @@ class OpenAlexAPIClient:
                 rate_limit_remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
                 redirect_url = response.headers.get("Location")
 
-                if not redirect_url:
+                if response.status == 200:
+                    # Direct stream. aiohttp already decodes Content-Encoding.
+                    content = await response.read()
+                    redirect_url = None
+                elif not redirect_url:
                     return DownloadResult(
                         work_id=work_id,
                         format=content_format,
@@ -355,10 +362,16 @@ class OpenAlexAPIClient:
                         error="No redirect URL in response",
                     )
 
-            # Download from the signed URL
-            async with session.get(redirect_url) as content_response:
-                content_response.raise_for_status()
-                content = await content_response.read()
+            if redirect_url:
+                # Legacy path: download from the signed URL
+                async with session.get(redirect_url) as content_response:
+                    content_response.raise_for_status()
+                    content = await content_response.read()
+
+            # TEI used to arrive as raw gzip bytes (application/gzip, no
+            # Content-Encoding). Unwrap so the saved .tei.xml is always XML.
+            if content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
 
             return DownloadResult(
                 work_id=work_id,
